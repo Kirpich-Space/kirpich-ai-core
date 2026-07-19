@@ -1,0 +1,69 @@
+# Resource Registry — ресурсные характеристики моделей для Scheduler.
+# В отличие от capability_registry.yaml, здесь не "что модель умеет",
+# а "сколько она стоит": VRAM, RAM при offload, время загрузки.
+#
+# vram_mb — реальное потребление VRAM при текущей конфигурации загрузки
+# (уже с учётом offload, если он используется). Именно это число Scheduler
+# использует при решении, поместится ли модель в свободную память.
+#
+# ram_offload_mb — диагностика для GUI/логов, Scheduler это число
+# в решениях не использует.
+#
+# path — опционально. Нужен только моделям, которые загружает встроенный
+# backend (EmbeddedBackend, поверх llama.cpp) напрямую по пути к файлу.
+# Модели, которые обслуживает LMStudioBackend, обращаются по имени через
+# LM Studio и это поле не заполняют — как показано ниже.
+#
+# Оценки под RTX 4060 (8GB VRAM) + 32GB DDR4. Значения приблизительные —
+# уточняются по факту использования.
+
+Nemotron:
+  vram_mb: 3000
+  load_seconds: 2
+  always_loaded: true
+  preferred_device: gpu
+
+Fable9B:
+  vram_mb: 6000
+  load_seconds: 5
+  always_loaded: true
+  preferred_device: gpu
+
+GLM47:
+  vram_mb: 8000
+  ram_offload_mb: 2000
+  load_seconds: 15
+  preferred_device: hybrid
+
+GPTOSS20:
+  vram_mb: 8000
+  ram_offload_mb: 10000
+  load_seconds: 30
+  preferred_device: hybrid
+
+Gemma27:
+  vram_mb: 8000
+  ram_offload_mb: 14000
+  load_seconds: 40
+  preferred_device: hybrid
+
+GLM51:
+  vram_mb: 8000
+  ram_offload_mb: 14000
+  load_seconds: 40
+  preferred_device: hybrid
+
+Qwen40B:
+  vram_mb: 8000
+  ram_offload_mb: 22000
+  load_seconds: 90
+  preferred_device: hybrid
+
+# Пример записи под EmbeddedBackend — понадобится, когда дойдём до
+# минимального вертикального среза (шаги 3–4 плана).
+# Gemma3_4B:
+#   path: models/gemma-3-4b.gguf
+#   vram_mb: 2500
+#   load_seconds: 5
+#   always_loaded: false
+#   preferred_device: gpu

@@ -1,0 +1,52 @@
+/* Минимальная сетка Layout'а через CSS Grid — без CSS-фреймворков.
+   Три ряда (шапка / основная область / статус-бар), в среднем ряду —
+   три колонки (список задач / рабочая область / детали), по образцу
+   Outliner–Viewport–Details из Unreal/Godot, см. утверждённый wireframe. */
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+.app-layout {
+  display: grid;
+  grid-template-areas:
+    'header header header'
+    'tasks workspace details'
+    'statusbar statusbar statusbar';
+  grid-template-rows: auto 1fr auto;
+  grid-template-columns: 260px 1fr 320px;
+  height: 100vh;
+}
+
+.app-layout > header {
+  grid-area: header;
+}
+
+.app-layout > aside:first-of-type {
+  grid-area: tasks;
+}
+
+.app-layout > main {
+  grid-area: workspace;
+}
+
+.app-layout > aside:last-of-type {
+  grid-area: details;
+}
+
+.app-layout > footer {
+  grid-area: statusbar;
+}
+
+/* Только чтобы на этапе заглушек было видно границы областей —
+   реальные стили появятся позже, это не финальный дизайн. */
+.app-layout > header,
+.app-layout > aside,
+.app-layout > main,
+.app-layout > footer {
+  border: 1px solid #ccc;
+  overflow: auto;
+}

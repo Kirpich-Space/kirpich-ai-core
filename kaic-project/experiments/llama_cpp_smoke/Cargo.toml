@@ -1,0 +1,19 @@
+[package]
+name = "llama_cpp_smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Никакой связи с проектом KAIC — отдельный пакет специально для того,
+# чтобы проверить llama-cpp-4 в изоляции, без транзитивных зависимостей
+# основного проекта (axum, rusqlite, teloxide и т.д.), которые к вопросу
+# "работает ли CUDA-сборка llama.cpp" отношения не имеют.
+
+[dependencies]
+anyhow = "1"
+encoding_rs = "0.8"
+llama-cpp-4 = "0.4.2"
+
+[features]
+# По умолчанию — CPU. Проверить CUDA: cargo run --features cuda -- ...
+cuda = ["llama-cpp-4/cuda"]

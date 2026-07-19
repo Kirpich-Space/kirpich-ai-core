@@ -1,0 +1,48 @@
+# Capability Registry — категория задачи → модель.
+# Router определяет только категорию (см. router.rs), а этот файл
+# решает, какая модель отвечает за неё. Чтобы поменять модель —
+# правится только этот файл, код не трогается.
+
+Simple:
+  primary: Nemotron
+
+Programming:
+  primary: Fable9B
+  fallback:
+    - GLM47
+    - GPTOSS20
+    - Gemma27
+
+LargeProject:
+  primary: GPTOSS20
+  fallback:
+    - Gemma27
+
+Engineering:
+  primary: GLM51
+  fallback:
+    - Gemma27
+    - GPTOSS20
+
+DeepAnalysis:
+  primary: Gemma27
+  fallback:
+    - GLM51
+
+Video:
+  # Само видео монтируется через ffmpeg (см. Tool System), не через LLM.
+  # Модель нужна для сопутствующих текстовых задач: описание, название,
+  # таймкоды, разбор сценария.
+  primary: Fable9B
+  fallback:
+    - GLM47
+
+Research:
+  primary: Fable9B
+  fallback:
+    - Gemma27
+    - GLM51
+
+MaximumQuality:
+  primary: Qwen40B
+  manual_only: true

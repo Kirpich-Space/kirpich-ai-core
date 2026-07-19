@@ -1,0 +1,69 @@
+[package]
+name = "kaic"
+version = "0.1.0"
+edition = "2021"
+description = "Kirpich AI Core — личная локальная агентная система"
+authors = ["Kirpich"]
+
+[[bin]]
+name = "kaic"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — нужен всем компонентам: Scheduler, Model Backend, Telegram Bridge
+tokio = { version = "1", features = ["full"] }
+
+# HTTP-сервер для Control Center API (Electron сейчас, Telegram Bridge позже —
+# оба обычные HTTP-клиенты одного и того же API)
+axum = "0.7"
+
+# CORS для Electron renderer, обращающегося к localhost с другого origin
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Позволяет использовать async-методы в trait ModelBackend как dyn-объект
+# (нативный async fn в trait пока не object-safe в стабильном Rust)
+async-trait = "0.1"
+
+# Конфиги (Capability Registry, Resource Registry) — простые YAML-таблицы
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# HTTP-клиент для Model Backend → LM Studio (OpenAI-совместимый API).
+# Без TLS-бэкенда: мы всегда обращаемся только к http://localhost,
+# native-tls/OpenSSL здесь не нужны и лишь усложняют сборку на Windows.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# Task Store — персистентность в один файл, без отдельного сервиса БД
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Telegram Bridge — Human-in-the-Loop
+teloxide = { version = "0.13", features = ["macros"] }
+
+# Task ID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Таймстемпы задач
+chrono = { version = "0.4", features = ["serde"] }
+
+# Логирование — минимальное, чтобы видеть что происходит без присмотра
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Простая обработка ошибок без ручных Error-enum на каждый случай
+anyhow = "1"
+
+# Встроенный inference через llama.cpp — опционально (см. [features] ниже).
+# Без явного --features embedded-backend эта зависимость вообще не тянется,
+# поэтому обычный `cargo build` не требует CUDA Toolkit, как и раньше.
+llama-cpp-4 = { version = "0.4.2", optional = true }
+encoding_rs = { version = "0.8", optional = true }
+
+[features]
+# CPU-инференс через встроенный llama.cpp, без внешнего LM Studio.
+embedded-backend = ["dep:llama-cpp-4", "dep:encoding_rs"]
+# То же самое + CUDA-оффлоад (требует установленный CUDA Toolkit для сборки).
+embedded-backend-cuda = ["embedded-backend", "llama-cpp-4/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = true
