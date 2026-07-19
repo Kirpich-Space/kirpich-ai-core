@@ -1,0 +1,29 @@
+# Rust
+**/target/
+
+# Node / Electron
+**/node_modules/
+**/dist/
+
+# Models
+*.gguf
+*.bin
+models/
+
+# Logs
+*.log
+
+# Databases
+*.db
+*.sqlite
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
