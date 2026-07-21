@@ -1,0 +1,18 @@
+# Rust
+target/
+
+# Models
+*.gguf
+*.bin
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

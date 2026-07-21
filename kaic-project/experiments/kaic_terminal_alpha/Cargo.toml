@@ -1,0 +1,19 @@
+[package]
+name = "kaic_terminal_alpha"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Автономный пакет, как и llama_cpp_smoke — ноль зависимости от
+# kaic-backend (axum/rusqlite/teloxide и т.д.). Цель: доказать рабочий
+# терминальный chat-pipeline поверх уже проверенного llama-cpp-4 перед
+# тем, как решать вопрос переноса в основной проект.
+
+[dependencies]
+anyhow = "1"
+encoding_rs = "0.8"
+llama-cpp-4 = "0.4.2"
+
+[features]
+# По умолчанию — CPU. Проверить CUDA: cargo run --features cuda -- ...
+cuda = ["llama-cpp-4/cuda"]

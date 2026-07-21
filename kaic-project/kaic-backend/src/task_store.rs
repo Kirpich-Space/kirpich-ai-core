@@ -137,7 +137,7 @@ impl TaskStore {
         let conn = self.conn.clone();
         let task_clone = task.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             insert_task(&conn, &task_clone)
         })
         .await
@@ -151,7 +151,7 @@ impl TaskStore {
     pub async fn list(&self) -> Result<Vec<Task>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<Task>> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, category, status, created_at, updated_at, context, pending_telegram_message_id
@@ -177,7 +177,7 @@ impl TaskStore {
     pub async fn get(&self, id: Uuid) -> Result<Option<Task>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<Task>> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             select_task_by_id(&conn, &id.to_string())
         })
         .await
@@ -191,7 +191,7 @@ impl TaskStore {
     ) -> Result<Option<Task>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<Task>> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             select_task_by_pending_message(&conn, message_id)
         })
         .await
@@ -202,7 +202,7 @@ impl TaskStore {
     pub async fn set_status(&self, id: Uuid, status: TaskStatus) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             conn.execute(
                 "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![status.as_str(), Utc::now().to_rfc3339(), id.to_string()],
@@ -223,7 +223,7 @@ impl TaskStore {
     ) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             conn.execute(
                 "UPDATE tasks SET pending_telegram_message_id = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![message_id, Utc::now().to_rfc3339(), id.to_string()],
@@ -242,7 +242,7 @@ impl TaskStore {
     pub async fn append_context(&self, id: Uuid, entry: ContextEntry) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             let mut task = select_task_by_id(&conn, &id.to_string())?
                 .with_context(|| format!("задача {id} не найдена"))?;
             task.context.push(entry);
