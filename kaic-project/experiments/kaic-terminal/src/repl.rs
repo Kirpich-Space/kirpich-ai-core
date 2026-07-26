@@ -86,6 +86,11 @@ pub fn run(engine: &KaicEngine, config: &Config, project: &ProjectInfo) -> Resul
             handle_ls(project, rel);
             continue;
         }
+        if input == "/write" || input.starts_with("/write ") {
+            let rel = input.strip_prefix("/write").unwrap().trim();
+            handle_write(project, rel);
+            continue;
+        }
         if let Some(rest) = input.strip_prefix("/temp ") {
             handle_temp(&mut session, rest.trim());
             continue;
@@ -149,6 +154,86 @@ fn handle_ls(project: &ProjectInfo, rel_path: &str) {
     }
 }
 
+fn handle_write(project: &ProjectInfo, rel_path: &str) {
+    if rel_path.is_empty() {
+        eprintln!("[error] usage: /write <relative file path>\n");
+        return;
+    }
+
+    println!(
+        "Введите новое содержимое файла. Отдельная строка /end завершает ввод, \
+         /cancel отменяет операцию."
+    );
+    let mut content = String::new();
+
+    loop {
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => {
+                println!("\nЗапись отменена: получен EOF.\n");
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("[error] failed to read file content: {error}\n");
+                return;
+            }
+        }
+
+        let marker = line.trim_end_matches(['\r', '\n']);
+        match marker {
+            "/end" => break,
+            "/cancel" => {
+                println!("Запись отменена.\n");
+                return;
+            }
+            _ => content.push_str(&line),
+        }
+    }
+
+    print!("Записать {} байт в \"{rel_path}\"? [y/N] ", content.len());
+    if let Err(error) = io::stdout().flush() {
+        eprintln!("[error] failed to flush stdout: {error}\n");
+        return;
+    }
+
+    let mut confirmation = String::new();
+    match io::stdin().read_line(&mut confirmation) {
+        Ok(0) => {
+            println!("\nЗапись отменена: получен EOF.\n");
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("[error] failed to read confirmation: {error}\n");
+            return;
+        }
+    }
+
+    let confirmation = confirmation.trim().to_ascii_lowercase();
+    if confirmation != "y" && confirmation != "yes" {
+        println!("Запись отменена.\n");
+        return;
+    }
+
+    match tools::write_file(&project.root, rel_path, &content) {
+        Ok(outcome) if !outcome.changed => {
+            println!("Файл уже содержит ожидаемое содержимое; запись не выполнялась.\n");
+        }
+        Ok(outcome) => {
+            println!("Файл записан и проверен: {rel_path}");
+            if let Some(backup_path) = outcome.backup_path {
+                let shown_path = backup_path
+                    .strip_prefix(&project.root)
+                    .unwrap_or(&backup_path);
+                println!("Резервная копия: {}", shown_path.display());
+            }
+            println!("Audit log: .kaic/write-audit.log\n");
+        }
+        Err(error) => eprintln!("[error] {error:#}\n"),
+    }
+}
+
 fn handle_temp(session: &mut Session, value: &str) {
     match value.parse::<f32>() {
         Ok(t) if (0.0..=2.0).contains(&t) => {
@@ -170,6 +255,7 @@ fn print_help() {
          /history  — показать историю текущей сессии\n\
          /read F   — прочитать файл проекта и добавить его в контекст сессии\n\
          /ls [D]   — показать содержимое директории проекта (по умолчанию — корень)\n\
+         /write F  — безопасно записать файл (ввод до /end, отмена через /cancel)\n\
          project   — показать сведения о проекте\n\
          /exit     — выйти\n\
          Любой другой ввод отправляется модели как сообщение чата.\n"
