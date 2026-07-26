@@ -1,0 +1,2 @@
+# Frozen inference core: preserve exact bytes and always show textual diffs.
+src/core/engine.rs -text diff

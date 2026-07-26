@@ -1,0 +1,25 @@
+[package]
+name = "kaic-terminal"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+# Отдельный бинарный крейт, НЕ зависит от kaic-backend (axum/rusqlite/teloxide).
+# Inference-часть — прямое, минимально обёрнутое продолжение
+# experiments/llama_cpp_smoke, версии и фичи зависимостей идентичны ему,
+# чтобы не рисковать расхождением с уже доказанной рабочей конфигурацией.
+
+[[bin]]
+name = "kaic"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+encoding_rs = "0.8"
+llama-cpp-4 = "0.4.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[features]
+# По умолчанию — CPU. Проверить CUDA: cargo run --features cuda -- .
+cuda = ["llama-cpp-4/cuda"]
