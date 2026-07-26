@@ -5,6 +5,7 @@ use anyhow::Result;
 use crate::core::context::ProjectInfo;
 use crate::core::engine::{ChatMessage, ChatParams, KaicEngine};
 use crate::core::config::Config;
+use crate::{git_diff, git_log, git_show, git_status};
 use crate::tools;
 
 const SYSTEM_PROMPT: &str = "Ты — KAIC, локальный AI-ассистент, работающий в терминале внутри \
@@ -95,6 +96,11 @@ pub fn run(engine: &KaicEngine, config: &Config, project: &ProjectInfo) -> Resul
             handle_temp(&mut session, rest.trim());
             continue;
         }
+        if input == "/git-show" || input.starts_with("/git-show ") {
+            let revision = input.strip_prefix("/git-show").unwrap().trim();
+            handle_git_show(project, revision);
+            continue;
+        }
 
         match input {
             "/exit" => break,
@@ -106,6 +112,9 @@ pub fn run(engine: &KaicEngine, config: &Config, project: &ProjectInfo) -> Resul
             "/history" => println!("{}\n", session.history_text()),
             "/model" => println!("Модель: {}\n", session.model_path),
             "/temp" => println!("Текущая temperature: {}\n", session.temperature),
+            "/git-status" => handle_git_status(project),
+            "/git-diff" => handle_git_diff(project),
+            "/git-log" => handle_git_log(project),
             "project" => println!("{}\n", project.summary()),
             _ => {
                 session.history.push(ChatMessage::new("user", input));
@@ -234,6 +243,39 @@ fn handle_write(project: &ProjectInfo, rel_path: &str) {
     }
 }
 
+fn handle_git_status(project: &ProjectInfo) {
+    match git_status::git_status(&project.root) {
+        Ok(output) => println!("{output}\n"),
+        Err(error) => eprintln!("[error] {error:#}\n"),
+    }
+}
+
+fn handle_git_diff(project: &ProjectInfo) {
+    match git_diff::git_diff(&project.root) {
+        Ok(output) => println!("{output}\n"),
+        Err(error) => eprintln!("[error] {error:#}\n"),
+    }
+}
+
+fn handle_git_log(project: &ProjectInfo) {
+    match git_log::git_log(&project.root) {
+        Ok(output) => println!("{output}\n"),
+        Err(error) => eprintln!("[error] {error:#}\n"),
+    }
+}
+
+fn handle_git_show(project: &ProjectInfo, revision: &str) {
+    if revision.is_empty() {
+        eprintln!("[error] usage: /git-show <revision>\n");
+        return;
+    }
+
+    match git_show::git_show(&project.root, revision) {
+        Ok(output) => println!("{output}\n"),
+        Err(error) => eprintln!("[error] {error:#}\n"),
+    }
+}
+
 fn handle_temp(session: &mut Session, value: &str) {
     match value.parse::<f32>() {
         Ok(t) if (0.0..=2.0).contains(&t) => {
@@ -256,6 +298,10 @@ fn print_help() {
          /read F   — прочитать файл проекта и добавить его в контекст сессии\n\
          /ls [D]   — показать содержимое директории проекта (по умолчанию — корень)\n\
          /write F  — безопасно записать файл (ввод до /end, отмена через /cancel)\n\
+         /git-status       — показать branch и состояние working tree\n\
+         /git-diff         — показать unstaged и staged изменения\n\
+         /git-log          — показать последние 20 коммитов\n\
+         /git-show REV     — показать выбранный коммит и его patch\n\
          project   — показать сведения о проекте\n\
          /exit     — выйти\n\
          Любой другой ввод отправляется модели как сообщение чата.\n"

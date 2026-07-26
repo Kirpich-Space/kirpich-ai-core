@@ -1,4 +1,10 @@
 mod core;
+mod git_diff;
+mod git_log;
+mod git_show;
+mod git_status;
+#[cfg(test)]
+mod git_test_support;
 mod repl;
 mod tools;
 
