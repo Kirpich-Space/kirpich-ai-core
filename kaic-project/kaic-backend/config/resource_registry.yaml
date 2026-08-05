@@ -2,6 +2,13 @@
 # В отличие от capability_registry.yaml, здесь не "что модель умеет",
 # а "сколько она стоит": VRAM, RAM при offload, время загрузки.
 #
+# lm_studio_key — ключ модели в LM Studio (поле `key` в GET /api/v1/models).
+# Ярлык (Nemotron, Fable9B, ...) остаётся внутренним именем KAIC: Router
+# определяет только категорию, Capability Registry сопоставляет категорию с
+# ярлыком, и лишь этот файл знает, во что ярлык разворачивается у провайдера.
+# Без этого поля backend отправлял в LM Studio сам ярлык и получал
+# "Model not found: Nemotron" — ярлыки никогда не совпадали с ключами.
+#
 # vram_mb — реальное потребление VRAM при текущей конфигурации загрузки
 # (уже с учётом offload, если он используется). Именно это число Scheduler
 # использует при решении, поместится ли модель в свободную память.
@@ -11,53 +18,165 @@
 #
 # path — опционально. Нужен только моделям, которые загружает встроенный
 # backend (EmbeddedBackend, поверх llama.cpp) напрямую по пути к файлу.
-# Модели, которые обслуживает LMStudioBackend, обращаются по имени через
+# Модели, которые обслуживает LMStudioBackend, обращаются по ключу через
 # LM Studio и это поле не заполняют — как показано ниже.
 #
-# Оценки под RTX 4060 (8GB VRAM) + 32GB DDR4. Значения приблизительные —
-# уточняются по факту использования.
+# vram_mb — ПОЛНЫЙ (max) footprint модели, а не наблюдавшееся потребление.
+#
+# Почему не измеренное значение: LM Studio сама выбирает долю GPU-оффлоада
+# исходя из свободной памяти в момент загрузки. Замер 2026-07-29 дал для
+# Nemotron 6613 MB — но это ровно ratio≈0.25, выбранный автоматически в тот
+# момент, а не свойство модели. При другом состоянии памяти LM Studio выберет
+# другую долю, и число уедет. Полный footprint (`lms load --gpu max
+# --estimate-only`) от состояния машины не зависит и потому пригоден как
+# константа реестра.
+#
+# Управление долей оффлоада программно возможно только через CLI/SDK — REST
+# API, которым ходит LmStudioBackend, параметр `gpu` не принимает
+# (проверено: "Unrecognized key(s) in object: 'gpu'"). Интеграция отложена
+# отдельной задачей.
+#
+# --- temperature и context_length ---
+#
+# Это ДВА РАЗНЫХ ПО ПРИРОДЕ параметра, и разница установлена эмпирически,
+# а не взята из документации:
+#
+# * temperature — параметр ВЫЗОВА. `/v1/chat/completions` его принимает:
+#   на заведомо неверный тип отвечает
+#   "Field with key llm.prediction.temperature does not satisfy the schema:
+#    Expected number, received nan" — то есть ключ схеме известен.
+#   Менять его можно на каждый запрос, перезагрузка модели не нужна.
+#
+# * context_length — параметр ЗАГРУЗКИ. На `/v1/chat/completions` он молча
+#   игнорируется (запрос с заведомо неверным типом отработал успешно), зато
+#   распознаётся схемой `/api/v1/models/load` и виден в конфиге загруженного
+#   инстанса. Смена значения требует ПЕРЕЗАГРУЗКИ модели.
+#
+# temperature ПРИМЕНЯЕТСЯ: заданное здесь значение уходит в каждый запрос
+# к провайдеру. `null` означает «не задана» — тогда поле не отправляется
+# ВООБЩЕ (не как null, а отсутствует в JSON), и действует умолчание
+# LM Studio. Проверено вживую: с temperature: -1.0 провайдер отвечает
+# 400 Bad Request ("too_small, minimum: 0"), то есть значение реально
+# доходит до него; с null задачи выполняются как прежде.
+#
+# context_length ПОКА НЕ ПРИМЕНЯЕТСЯ — это наблюдаемое состояние, а не
+# настройка: чтобы его сменить, модель нужно выгрузить и загрузить заново.
+
+# Умолчание LM Studio для context_length, подтверждённое замером на ДВУХ
+# моделях (Fable9B и Nemotron дали одинаковые 8192 при разных
+# max_context_length) — то есть это дефолт провайдера, а не свойство модели.
+# Оставлено здесь как справочная константа для сравнения.
+# lm_studio_default_context_length: 8192
 
 Nemotron:
-  vram_mb: 3000
-  load_seconds: 2
-  always_loaded: true
+  lm_studio_key: nvidia/nemotron-3-nano-omni
+  vram_mb: 25723 # 25.12 GiB, полный footprint
+  load_seconds: 34
+  always_loaded: false
   preferred_device: gpu
+  # измерено на реальной загрузке 2026-08-04
+  context_length: 8192
+  max_context_length: 262144
+  # temperature: null — поле не отправляется, действует умолчание LM Studio
+  # (своё умолчание она через API не сообщает).
+  temperature: null
 
+# Резидентная модель. Выбрана вместо Nemotron: её полный footprint 5.60 GiB
+# оставляет ~20 GiB запаса, тогда как Nemotron в одиночку занимает 25.12 GiB
+# из ~25.6 GiB доступных — хрупко даже без конкуренции за память.
 Fable9B:
-  vram_mb: 6000
-  load_seconds: 5
+  lm_studio_key: qwable-9b-claude-fable-5-obliterated-i1
+  vram_mb: 5734 # 5.60 GiB, полный footprint
+  load_seconds: 9
   always_loaded: true
   preferred_device: gpu
+  # измерено на реальной загрузке 2026-08-04
+  context_length: 8192
+  max_context_length: 262144
+  # temperature: null — поле не отправляется, действует умолчание LM Studio
+  # (своё умолчание она через API не сообщает).
+  temperature: null
+
+# ВНИМАНИЕ: измерено 0 MB VRAM — LM Studio разместила модель целиком в RAM,
+# на GPU не ушло ничего. Формально по VRAM она "бесплатна", и Scheduler будет
+# считать, что она помещается всегда, но фактическая загрузка заняла 435 с
+# (в 14 раз дольше плановых 30 с), а генерация идёт на CPU. Число честное,
+# но планировать по нему латентность нельзя — это ограничение самой метрики
+# vram_mb, вынесено архитектору отдельным вопросом.
+GPTOSS20:
+  lm_studio_key: openai/gpt-oss-20b
+  vram_mb: 0
+  ram_offload_mb: 11300
+  load_seconds: 435
+  preferred_device: cpu
+  # НЕ ИЗМЕРЕНО: модель не загружается на этой машине (не хватает
+  # памяти), эффективный context_length получить неоткуда.
+  # max_context_length — факт из GET /api/v1/models, не оценка.
+  context_length: null
+  max_context_length: 131072
+  temperature: null
+
+# --- Модели, которые эта машина не запускает вообще ---
+#
+# LM Studio отказывает на этапе загрузки: требуемая память превышает
+# доступную (32 GiB RAM, из них свободно ~19 GiB). Ключи при этом
+# ПОДТВЕРЖДЕНЫ: отказ приходит с текстом
+# "Failed to load LLM '<key>': ... insufficient system resources",
+# то есть модель найдена и её требования посчитаны — это не "Model not found".
+#
+# vram_mb ниже — не измеренное потребление VRAM (измерить невозможно, модель
+# не загружается), а заявленная LM Studio полная потребность в памяти.
+# Семантика поля здесь иная, чем у измеренных выше; для Scheduler это
+# работает корректно (любое число больше 8188 означает "не помещается"),
+# но в терминах документации файла это натяжка — тоже вопрос архитектору.
 
 GLM47:
-  vram_mb: 8000
-  ram_offload_mb: 2000
+  lm_studio_key: zai-org/glm-4.7-flash
+  vram_mb: 17860 # заявленная потребность, не измерение; не загружается
   load_seconds: 15
   preferred_device: hybrid
-
-GPTOSS20:
-  vram_mb: 8000
-  ram_offload_mb: 10000
-  load_seconds: 30
-  preferred_device: hybrid
+  # НЕ ИЗМЕРЕНО: модель не загружается на этой машине (не хватает
+  # памяти), эффективный context_length получить неоткуда.
+  # max_context_length — факт из GET /api/v1/models, не оценка.
+  context_length: null
+  max_context_length: 202752
+  temperature: null
 
 Gemma27:
-  vram_mb: 8000
-  ram_offload_mb: 14000
+  lm_studio_key: google/gemma-4-26b-a4b
+  vram_mb: 18210 # заявленная потребность, не измерение; не загружается
   load_seconds: 40
   preferred_device: hybrid
+  # НЕ ИЗМЕРЕНО: модель не загружается на этой машине (не хватает
+  # памяти), эффективный context_length получить неоткуда.
+  # max_context_length — факт из GET /api/v1/models, не оценка.
+  context_length: null
+  max_context_length: 262144
+  temperature: null
 
 GLM51:
-  vram_mb: 8000
-  ram_offload_mb: 14000
+  lm_studio_key: q3.6-27b-glm-5.1-da
+  vram_mb: 18190 # заявленная потребность, не измерение; не загружается
   load_seconds: 40
   preferred_device: hybrid
+  # НЕ ИЗМЕРЕНО: модель не загружается на этой машине (не хватает
+  # памяти), эффективный context_length получить неоткуда.
+  # max_context_length — факт из GET /api/v1/models, не оценка.
+  context_length: null
+  max_context_length: 262144
+  temperature: null
 
 Qwen40B:
-  vram_mb: 8000
-  ram_offload_mb: 22000
+  lm_studio_key: qwen3.6-40b-claude-4.6-opus-deckard-heretic-uncensored-thinking-neo-code-di-imatrix-max
+  vram_mb: 27140 # заявленная потребность, не измерение; не загружается
   load_seconds: 90
   preferred_device: hybrid
+  # НЕ ИЗМЕРЕНО: модель не загружается на этой машине (не хватает
+  # памяти), эффективный context_length получить неоткуда.
+  # max_context_length — факт из GET /api/v1/models, не оценка.
+  context_length: null
+  max_context_length: 262144
+  temperature: null
 
 # Пример записи под EmbeddedBackend — понадобится, когда дойдём до
 # минимального вертикального среза (шаги 3–4 плана).
