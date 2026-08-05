@@ -28,10 +28,27 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 
+# Разбор ответов внешних API (Openverse в медиа-пайплайне). Уже присутствовал
+# в дереве транзитивно через reqwest/teloxide — здесь лишь объявлен прямой
+# зависимостью, версия в Cargo.lock не меняется.
+serde_json = "1"
+
 # HTTP-клиент для Model Backend → LM Studio (OpenAI-совместимый API).
 # Без TLS-бэкенда: мы всегда обращаемся только к http://localhost,
 # native-tls/OpenSSL здесь не нужны и лишь усложняют сборку на Windows.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# Изначально собирался без TLS: единственным адресатом был http://localhost
+# (LM Studio). С появлением медиа-пайплайна это перестало быть верным —
+# Openverse доступен только по HTTPS, и без TLS-бэкенда reqwest отправляет
+# plain HTTP на 443 порт, получая от Cloudflare 400 "The plain HTTP request
+# was sent to HTTPS port".
+#
+# Взят rustls, а не native-tls: исходное возражение было против
+# OpenSSL/native-tls, усложняющих сборку на Windows, — rustls его не
+# затрагивает, это чистый Rust без системных зависимостей.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 
 # Task Store — персистентность в один файл, без отдельного сервиса БД
 rusqlite = { version = "0.31", features = ["bundled"] }

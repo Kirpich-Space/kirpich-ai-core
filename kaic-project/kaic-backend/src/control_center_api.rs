@@ -29,11 +29,18 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+use crate::media::credits::{plan_render, RenderPlan};
+use crate::media::fetch as media_fetch;
+use crate::media::gate::{admit, AdmittedAsset, Timeline};
+use crate::media::openverse;
+use crate::media::provenance::{Manifest, ManifestEntry};
+use crate::media::query as media_query_extract;
+use crate::media::render as media_render;
 use crate::model_backend::{GenerateRequest, Message, Role};
 use crate::resource_registry::ResourceRegistry;
 // Алиас: axum тоже экспортирует тип `Router`, поэтому наш классификатор
 // задач импортируется под другим именем — иначе имена конфликтуют.
-use crate::router::{Router as TaskRouter, TaskMetadata};
+use crate::router::{Category, Router as TaskRouter, TaskMetadata};
 use crate::scheduler::Scheduler;
 use crate::task_store::{ContextEntry, Task, TaskStatus, TaskStore};
 
@@ -54,6 +61,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/tasks/:id/pause", post(pause_task))
         .route("/tasks/:id/cancel", post(cancel_task))
         .route("/models", get(list_models))
+        .route("/models/:name/temperature", post(set_model_temperature))
         .route("/status", get(status))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -166,6 +174,428 @@ async fn create_task(
     Ok(Json(refreshed))
 }
 
+// --- Медиа-пайплайн (Category::Video) ----------------------------------------
+
+/// Лицензии, которые запрашиваются у источника.
+///
+/// Дублированием политики гейта это не является: здесь фильтр нужен, чтобы
+/// заведомо негодные ассеты не приезжали вовсе, а решение всё равно принимает
+/// `media::gate::admit` — он же отвергнет всё, что просочилось.
+const REQUESTED_LICENSES: &[&str] = &["cc0", "pdm", "by"];
+
+/// Сколько кандидатов запрашивать у источника за один проход.
+const SEARCH_PAGE_SIZE: u8 = 5;
+
+/// Роль записи контекста, несущей путь к готовому файлу-результату.
+/// Клиенты (Telegram Bridge) читают её напрямую и не разбирают текст сводки.
+pub const ARTIFACT_ROLE: &str = "artifact";
+
+/// Куда складываются скачанные ассеты.
+///
+/// Рядом с журналом отправок Telegram (`.kaic/`), по задаче на подкаталог:
+/// файлы одной задачи не смешиваются с другой, а весь кэш удаляется одной
+/// директорией. Временный каталог ОС не подходит — материалы должны пережить
+/// перезапуск, иначе план будет ссылаться в никуда.
+fn media_cache_dir(task_id: Uuid) -> std::path::PathBuf {
+    std::path::PathBuf::from(".kaic")
+        .join("media-cache")
+        .join(task_id.to_string())
+}
+
+/// Куда кладётся готовое видео. Отдельно от кэша исходников: результат и
+/// материалы имеют разный срок жизни — кэш можно снести, результат нужен.
+fn media_render_dir(task_id: Uuid) -> std::path::PathBuf {
+    std::path::PathBuf::from(".kaic")
+        .join("renders")
+        .join(task_id.to_string())
+}
+
+/// Сборка плана из записей манифеста. Чистая функция: ни сети, ни Task Store —
+/// поэтому отказ гейта проверяется тестом без обращения к Openverse.
+///
+/// Возвращает план и список причин отказа по каждому непринятому ассету:
+/// отказы не проглатываются, они попадают в контекст задачи.
+fn admit_all(entries: Vec<ManifestEntry>) -> Result<(Manifest, Vec<AdmittedAsset>, Vec<String>), String> {
+    if entries.is_empty() {
+        return Err("источник не вернул ни одного ассета".to_string());
+    }
+
+    let mut manifest = Manifest::new();
+    let mut asset_ids = Vec::new();
+    for entry in entries {
+        asset_ids.push(entry.asset_id.clone());
+        manifest.insert(entry);
+    }
+
+    let mut admitted = Vec::new();
+    let mut rejections = Vec::new();
+    for asset_id in &asset_ids {
+        match admit(&manifest, asset_id) {
+            Ok(asset) => admitted.push(asset),
+            // Отказ гейта — ожидаемый исход, а не сбой: непригодный ассет
+            // просто не попадает на таймлайн, задача продолжается.
+            Err(rejection) => rejections.push(rejection.to_string()),
+        }
+    }
+
+    if admitted.is_empty() {
+        return Err(format!(
+            "гейт не допустил ни одного ассета из {}: {}",
+            asset_ids.len(),
+            rejections.join("; ")
+        ));
+    }
+
+    Ok((manifest, admitted, rejections))
+}
+
+/// План строится из тех ассетов, что реально дошли до диска.
+///
+/// Порядок «гейт → загрузка → план», а не «гейт → план → загрузка», выбран
+/// сознательно: план и титры обязаны описывать то, что есть на самом деле.
+/// Если ассет не скачался, его строка в титрах была бы ложью, а его ID в
+/// плане — ссылкой в никуда.
+fn plan_from_admitted(admitted: Vec<AdmittedAsset>) -> Result<RenderPlan, String> {
+    let mut timeline = Timeline::new();
+    for asset in admitted {
+        timeline.push(asset);
+    }
+    plan_render(&timeline).map_err(|err| format!("план не собран: {err}"))
+}
+
+/// Гейт + план без загрузки. Используется тестами: они проверяют политику
+/// допуска, для которой сеть не нужна.
+#[cfg(test)]
+fn assemble_render_plan(entries: Vec<ManifestEntry>) -> Result<(RenderPlan, Vec<String>), String> {
+    let (_manifest, admitted, rejections) = admit_all(entries)?;
+    let plan = plan_from_admitted(admitted)?;
+    Ok((plan, rejections))
+}
+
+/// Полный проход медиа-задачи: реальный поиск → гейт → манифест → план рендера.
+///
+/// ffmpeg здесь не запускается: план остаётся данными. Исполнение рендера —
+/// отдельная задача.
+async fn run_video_pipeline(
+    task_store: Arc<TaskStore>,
+    scheduler: Arc<Scheduler>,
+    task_id: Uuid,
+    messages: &[Message],
+) {
+    let Some(raw_text) = media_query(messages) else {
+        fail_task(
+            &task_store,
+            task_id,
+            "в задаче нет пользовательского текста для поиска материалов".to_string(),
+        )
+        .await;
+        return;
+    };
+
+    let query = extract_search_term(&scheduler, &task_store, task_id, &raw_text).await;
+
+    note(
+        &task_store,
+        task_id,
+        format!("медиа-пайплайн: ищу материалы в Openverse по запросу «{query}»"),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+
+    // Источник требует совпадения ВСЕХ слов запроса, поэтому лишнее слово не
+    // уточняет выдачу, а обнуляет её. Пробуем от самого узкого варианта к
+    // широкому, а в конце — исходный текст задачи дословно (прежнее поведение).
+    let mut attempts = media_query_extract::narrowing_variants(&query);
+    if !attempts.iter().any(|a| a == &raw_text) {
+        attempts.push(raw_text.clone());
+    }
+
+    let mut entries = Vec::new();
+    let mut used_query = query.clone();
+    for attempt in &attempts {
+        match openverse::search_images(&client, attempt, REQUESTED_LICENSES, SEARCH_PAGE_SIZE).await
+        {
+            Ok(found) if !found.is_empty() => {
+                entries = found;
+                used_query = attempt.clone();
+                break;
+            }
+            Ok(_) => {
+                note(
+                    &task_store,
+                    task_id,
+                    format!("по запросу «{attempt}» ничего не найдено, расширяю поиск"),
+                )
+                .await;
+            }
+            Err(err) => {
+                fail_task(&task_store, task_id, format!("источник недоступен: {err:#}")).await;
+                return;
+            }
+        }
+    }
+
+    note(
+        &task_store,
+        task_id,
+        format!(
+            "источник вернул {} кандидатов по запросу «{used_query}», проверяю гейтом",
+            entries.len()
+        ),
+    )
+    .await;
+
+    let (manifest, admitted, rejections) = match admit_all(entries) {
+        Ok(result) => result,
+        Err(reason) => {
+            fail_task(&task_store, task_id, reason).await;
+            return;
+        }
+    };
+    if !rejections.is_empty() {
+        note(
+            &task_store,
+            task_id,
+            format!("отклонено гейтом: {}", rejections.join("; ")),
+        )
+        .await;
+    }
+
+    // Скачиваются только допущенные гейтом ассеты: тянуть по сети то, что
+    // всё равно нельзя использовать, бессмысленно.
+    let target_dir = media_cache_dir(task_id);
+    let mut downloaded = Vec::new();
+    let mut usable = Vec::new();
+    let mut fetch_failures = Vec::new();
+    for asset in admitted {
+        let Some(entry) = manifest.get(asset.asset_id()) else {
+            continue;
+        };
+        match media_fetch::fetch_and_verify(&client, entry, &target_dir).await {
+            Ok(file) => {
+                downloaded.push(file);
+                usable.push(asset);
+            }
+            // Сбой одного ассета не роняет задачу: причина записывается,
+            // остальные продолжают путь.
+            Err(err) => fetch_failures.push(err.to_string()),
+        }
+    }
+
+    if !fetch_failures.is_empty() {
+        note(
+            &task_store,
+            task_id,
+            format!("не загружено: {}", fetch_failures.join("; ")),
+        )
+        .await;
+    }
+    if usable.is_empty() {
+        fail_task(
+            &task_store,
+            task_id,
+            "ни один допущенный ассет не удалось загрузить и верифицировать".to_string(),
+        )
+        .await;
+        return;
+    }
+
+    note(
+        &task_store,
+        task_id,
+        format!(
+            "загружено и верифицировано {} из {} допущенных, каталог {}",
+            downloaded.len(),
+            downloaded.len() + fetch_failures.len(),
+            target_dir.display()
+        ),
+    )
+    .await;
+
+    match plan_from_admitted(usable) {
+        Ok(plan) => {
+            let files = downloaded
+                .iter()
+                .map(|f| {
+                    format!(
+                        "  {} → {} ({} байт, {})",
+                        f.asset_id,
+                        f.path.display(),
+                        f.bytes,
+                        f.format.extension()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let credits = if plan.credits_text().is_empty() {
+                "(не требуются: только public domain)".to_string()
+            } else {
+                plan.credits_text().to_string()
+            };
+            // Рендер: план + локальные файлы → настоящий видеофайл.
+            let render_dir = media_render_dir(task_id);
+            let rendered =
+                match media_render::render_slideshow(&downloaded, plan.credits_text(), &render_dir)
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    // Отказ ffmpeg — штатный Failed с причиной из stderr,
+                    // а не паника: причина видна в контексте задачи.
+                    Err(err) => {
+                        fail_task(&task_store, task_id, format!("рендер не удался: {err}")).await;
+                        return;
+                    }
+                };
+
+            let summary = format!(
+                "Видео готово.\nАссетов на таймлайне: {}\n\n\
+                 Файлы (скачаны и верифицированы):\n{}\n\nТитры:\n{}\n\n\
+                 Результат: {} ({} байт, рендер {} мс)",
+                plan.asset_ids().len(),
+                files,
+                credits,
+                rendered.path.display(),
+                rendered.bytes,
+                rendered.elapsed_ms
+            );
+
+            // Путь к результату отдельной записью, машиночитаемо: сводка
+            // выше предназначена человеку, и выкусывать из неё путь регуляркой
+            // означало бы завязать клиента на формат текста.
+            if let Err(err) = task_store
+                .append_context(
+                    task_id,
+                    ContextEntry {
+                        role: ARTIFACT_ROLE.to_string(),
+                        content: rendered.path.to_string_lossy().to_string(),
+                        at: Utc::now(),
+                    },
+                )
+                .await
+            {
+                tracing::error!("не удалось сохранить путь результата {task_id}: {err:#}");
+            }
+
+            if let Err(err) = task_store
+                .append_context(
+                    task_id,
+                    ContextEntry {
+                        role: "assistant".to_string(),
+                        content: summary,
+                        at: Utc::now(),
+                    },
+                )
+                .await
+            {
+                tracing::error!("не удалось сохранить план для задачи {task_id}: {err:#}");
+            }
+            if let Err(err) = task_store.set_status(task_id, TaskStatus::Done).await {
+                tracing::error!("не удалось обновить статус задачи {task_id}: {err:#}");
+            }
+        }
+        // Отказ гейта на всех ассетах — это Failed с внятной причиной, а не
+        // паника: задача завершается штатно, причина видна в контексте.
+        Err(reason) => fail_task(&task_store, task_id, reason).await,
+    }
+}
+
+/// Превращает свободный текст задачи в поисковый термин силами модели.
+///
+/// Шаг необязательный по построению: любая неудача — недоступная модель,
+/// пустой или неправдоподобный ответ — возвращает исходный текст дословно,
+/// то есть поведение откатывается к прежнему, а не ломается.
+async fn extract_search_term(
+    scheduler: &Arc<Scheduler>,
+    task_store: &Arc<TaskStore>,
+    task_id: Uuid,
+    raw_text: &str,
+) -> String {
+    let started = std::time::Instant::now();
+    let request = media_query_extract::build_request(raw_text);
+
+    let raw = match scheduler
+        .run_with_model(media_query_extract::EXTRACTION_MODEL_LABEL, request)
+        .await
+    {
+        Ok(response) => response.content,
+        Err(err) => {
+            note(
+                task_store,
+                task_id,
+                format!("извлечение термина не выполнено ({err:#}); ищу по тексту задачи"),
+            )
+            .await;
+            return raw_text.to_string();
+        }
+    };
+
+    match media_query_extract::sanitize(&raw) {
+        Some(term) => {
+            note(
+                task_store,
+                task_id,
+                format!(
+                    "поисковый термин: «{term}» (из «{raw_text}», {} мс)",
+                    started.elapsed().as_millis()
+                ),
+            )
+            .await;
+            term
+        }
+        None => {
+            note(
+                task_store,
+                task_id,
+                format!("модель не дала пригодный термин; ищу по тексту задачи «{raw_text}»"),
+            )
+            .await;
+            raw_text.to_string()
+        }
+    }
+}
+
+/// Поисковый термин для медиа-задачи.
+///
+/// Берётся ПЕРВОЕ пользовательское сообщение задачи как есть, дословно.
+/// Никакого разбора, выделения ключевых слов или интерпретации намерения
+/// здесь нет и быть не должно: как свободный текст превращается в
+/// структурированный медиа-запрос (термин + тип операции) — не решённый
+/// вопрос, и решать его молча в точке подключения нельзя.
+fn media_query(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .find(|m| matches!(m.role, Role::User))
+        .map(|m| m.content.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// Дописывает пояснение в контекст задачи, не меняя статус.
+async fn note(task_store: &Arc<TaskStore>, task_id: Uuid, content: String) {
+    if let Err(err) = task_store
+        .append_context(
+            task_id,
+            ContextEntry {
+                role: "system".to_string(),
+                content,
+                at: Utc::now(),
+            },
+        )
+        .await
+    {
+        tracing::error!("не удалось записать заметку задачи {task_id}: {err:#}");
+    }
+}
+
+async fn fail_task(task_store: &Arc<TaskStore>, task_id: Uuid, reason: String) {
+    tracing::warn!("медиа-задача {task_id} не выполнена: {reason}");
+    note(task_store, task_id, format!("Ошибка: {reason}")).await;
+    if let Err(err) = task_store.set_status(task_id, TaskStatus::Failed).await {
+        tracing::error!("не удалось обновить статус задачи {task_id}: {err:#}");
+    }
+}
+
 /// Переводит накопленный контекст задачи в историю сообщений для модели.
 /// Роли, не относящиеся напрямую к диалогу (например "system" — заметки
 /// об ошибках), сопоставляются с `Role::System`.
@@ -196,7 +626,20 @@ async fn run_task_pipeline(
     messages: Vec<Message>,
     allow_manual: bool,
 ) {
-    let request = GenerateRequest { messages };
+    // Первое и пока единственное ветвление по категории. До этого все
+    // категории шли одним путём (текст → модель → текст), и Video ничем не
+    // отличалась от Programming, хотя существовала в Router'е.
+    //
+    // Video не обращается к модели вообще: медиа-пайплайн — это поиск в
+    // лицензионном источнике, гейт и сборка плана, а не генерация текста.
+    if category == Category::Video.as_str() {
+        run_video_pipeline(task_store, scheduler, task_id, &messages).await;
+        return;
+    }
+
+    // temperature подставит Scheduler: только он знает, какая модель
+    // в итоге возьмёт задачу.
+    let request = GenerateRequest { messages, temperature: None };
 
     match scheduler.run(&category, allow_manual, request).await {
         Ok(response) => {
@@ -342,6 +785,14 @@ struct ModelStatusDto {
     preferred_device: &'static str,
     loaded: bool,
     last_used: Option<DateTime<Utc>>,
+    /// Параметр ЗАГРУЗКИ: смена требует перезагрузки модели.
+    /// `None` — не измерено (модель не загружается на этой машине).
+    context_length: Option<u32>,
+    /// Потолок, заявленный моделью. Известен без загрузки.
+    max_context_length: Option<u32>,
+    /// Параметр ВЫЗОВА: применяется на каждый запрос, перезагрузка не нужна.
+    /// `None` — не задана, действует умолчание провайдера.
+    temperature: Option<f32>,
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<Vec<ModelStatusDto>> {
@@ -358,10 +809,49 @@ async fn list_models(State(state): State<AppState>) -> Json<Vec<ModelStatusDto>>
             preferred_device: preferred_device_str(entry.preferred_device),
             loaded: loaded.contains_key(name),
             last_used: loaded.get(name).copied(),
+            context_length: entry.context_length,
+            max_context_length: entry.max_context_length,
+            // Через реестр, а не напрямую из entry: значение могло быть
+            // изменено в рантайме и ещё не перечитано с диска.
+            temperature: state.resource_registry.temperature_for(name),
         })
         .collect();
 
     Json(models)
+}
+
+/// Тело запроса на смену temperature.
+///
+/// `null` — осмысленное значение, а не отсутствие: оно означает «убрать
+/// настройку», после чего поле перестаёт отправляться провайдеру и
+/// действует его умолчание.
+#[derive(Deserialize)]
+struct SetTemperatureRequest {
+    temperature: Option<f32>,
+}
+
+/// Смена temperature модели. Перезагрузка не требуется — это параметр
+/// вызова (в отличие от context_length, который параметр загрузки).
+///
+/// Модель не обязана быть загружена: значение живёт в реестре и применится
+/// при следующем обращении к ней.
+async fn set_model_temperature(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<SetTemperatureRequest>,
+) -> Result<Json<Vec<ModelStatusDto>>, ApiError> {
+    // Валидация именно здесь, а не только в UI: маршрут — единственная
+    // точка, которую нельзя обойти (curl, Telegram, любой другой клиент).
+    // При отказе реестр не читается и не пишется вообще.
+    crate::resource_registry::validate_temperature(body.temperature)
+        .map_err(ApiError::BadRequest)?;
+
+    state
+        .resource_registry
+        .set_temperature(&name, body.temperature)
+        .map_err(ApiError::Internal)?;
+    tracing::info!("temperature модели '{name}' изменена на {:?}", body.temperature);
+    Ok(list_models(State(state)).await)
 }
 
 fn preferred_device_str(device: crate::resource_registry::PreferredDevice) -> &'static str {
@@ -413,6 +903,10 @@ async fn status(State(state): State<AppState>) -> Json<StatusDto> {
 /// либо любая внутренняя ошибка (500) с текстом причины.
 enum ApiError {
     NotFound,
+    /// Запрос отвергнут по содержимому — вина клиента, не сервера.
+    /// Текст уходит пользователю как есть, поэтому обязан называть поле
+    /// и допустимые значения.
+    BadRequest(String),
     Internal(anyhow::Error),
 }
 
@@ -426,10 +920,123 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "задача не найдена").into_response(),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             ApiError::Internal(err) => {
                 tracing::error!("Control Center API: {err:#}");
                 (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::provenance::{LicensedProvenance, MediaKind, Provenance};
+
+    fn entry(asset_id: &str, license: &str, attribution: &str) -> ManifestEntry {
+        ManifestEntry {
+            asset_id: asset_id.to_string(),
+            kind: MediaKind::Image,
+            provenance: Provenance::Licensed(LicensedProvenance {
+                source: "openverse".to_string(),
+                asset_url: "https://example.org/a.jpg".to_string(),
+                landing_url: "https://example.org/p".to_string(),
+                license: license.to_string(),
+                license_version: "2.0".to_string(),
+                license_url: "https://creativecommons.org/licenses/by/2.0/".to_string(),
+                license_snapshot: "снимок".to_string(),
+                creator: Some("Автор".to_string()),
+                creator_url: None,
+                attribution: attribution.to_string(),
+                retrieved_at: Utc::now(),
+            }),
+        }
+    }
+
+    #[test]
+    fn video_query_is_the_user_text_verbatim() {
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "служебное".to_string(),
+            },
+            Message {
+                role: Role::User,
+                content: "  горный ручей  ".to_string(),
+            },
+        ];
+
+        // Дословно, только с обрезкой пробелов: никакого разбора запроса.
+        assert_eq!(media_query(&messages), Some("горный ручей".to_string()));
+    }
+
+    #[test]
+    fn video_task_without_user_text_has_no_query() {
+        let messages = vec![Message {
+            role: Role::System,
+            content: "только служебное".to_string(),
+        }];
+        assert_eq!(media_query(&messages), None);
+
+        let blank = vec![Message {
+            role: Role::User,
+            content: "   ".to_string(),
+        }];
+        assert_eq!(media_query(&blank), None);
+    }
+
+    #[test]
+    fn gate_rejection_of_every_asset_yields_error_not_panic() {
+        // ND запрещает производные произведения; монтаж — производное.
+        // В потоке задачи это должно давать штатную ошибку (→ Failed),
+        // а не панику и не пустой успешный план.
+        let entries = vec![
+            entry("openverse:1", "by-nd", "credit"),
+            entry("openverse:2", "by-nc-nd", "credit"),
+        ];
+
+        let result = assemble_render_plan(entries);
+
+        let reason = result.expect_err("ND-ассеты не могут дать план");
+        assert!(reason.contains("гейт не допустил ни одного"), "причина: {reason}");
+        assert!(reason.contains("ND"), "причина обязана называть ND: {reason}");
+    }
+
+    #[test]
+    fn empty_source_result_is_an_error() {
+        let reason = assemble_render_plan(Vec::new()).expect_err("пустой ответ — ошибка");
+        assert!(reason.contains("ни одного ассета"), "причина: {reason}");
+    }
+
+    #[test]
+    fn partial_rejection_keeps_good_assets_and_reports_the_rest() {
+        // Смешанный результат поиска — типичный случай: часть ассетов годная,
+        // часть нет. Задача должна выполниться на годных, а отказы —
+        // попасть в отчёт, а не потеряться.
+        let entries = vec![
+            entry("openverse:good", "by", "\"X\" by Автор is licensed under CC BY 2.0."),
+            entry("openverse:nd", "by-nd", "credit"),
+            entry("openverse:pd", "cc0", ""),
+        ];
+
+        let (plan, rejections) = assemble_render_plan(entries).expect("план собирается");
+
+        assert_eq!(plan.asset_ids().len(), 2, "годные ассеты на таймлайне");
+        assert_eq!(rejections.len(), 1, "отказ не проглочен");
+        assert!(rejections[0].contains("ND"));
+        assert!(
+            plan.credits_text().contains("Автор"),
+            "CC-BY-материал обязан быть в титрах"
+        );
+    }
+
+    #[test]
+    fn cc_by_without_attribution_is_rejected_in_flow() {
+        // Гейт не выпустит CC-BY без строки автора — титры собрать нечем.
+        let entries = vec![entry("openverse:1", "by", "")];
+
+        let reason = assemble_render_plan(entries).expect_err("нечем делать титры");
+        assert!(reason.contains("атрибуции"), "причина: {reason}");
     }
 }
