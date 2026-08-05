@@ -30,7 +30,9 @@ impl Session {
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             context: config.context,
-            model_path: config.model_path.clone(),
+            // Сессия REPL показывает и использует свою, диалоговую модель:
+            // модель Planner'а к терминалу отношения не имеет.
+            model_path: config.models.repl.clone(),
         }
     }
 
@@ -54,6 +56,9 @@ impl Session {
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             context: self.context,
+            // Свободный чат в REPL ничем не ограничивается: грамматика — это
+            // инструмент агентного слоя, а не режим работы терминала.
+            grammar: None,
         }
     }
 }
@@ -90,6 +95,16 @@ pub fn run(engine: &KaicEngine, config: &Config, project: &ProjectInfo) -> Resul
         if input == "/write" || input.starts_with("/write ") {
             let rel = input.strip_prefix("/write").unwrap().trim();
             handle_write(project, rel);
+            continue;
+        }
+        if input == "/create-file" || input.starts_with("/create-file ") {
+            let rel = input.strip_prefix("/create-file").unwrap().trim();
+            handle_create_file(project, rel);
+            continue;
+        }
+        if input == "/create-directory" || input.starts_with("/create-directory ") {
+            let rel = input.strip_prefix("/create-directory").unwrap().trim();
+            handle_create_directory(project, rel);
             continue;
         }
         if let Some(rest) = input.strip_prefix("/temp ") {
@@ -200,7 +215,27 @@ fn handle_write(project: &ProjectInfo, rel_path: &str) {
         }
     }
 
-    print!("Записать {} байт в \"{rel_path}\"? [y/N] ", content.len());
+    let prepared = match tools::prepare_write_file(&project.root, rel_path, &content) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("[error] {error:#}\n");
+            return;
+        }
+    };
+
+    println!(
+        "\n--- write_file diff ---\n{}--- end diff ---\n",
+        prepared.diff()
+    );
+    if !prepared.has_changes() {
+        println!("Изменений нет; запись не выполнялась.\n");
+        return;
+    }
+
+    print!(
+        "Применить показанный diff и записать {} байт в \"{rel_path}\"? [y/N] ",
+        prepared.bytes_to_write()
+    );
     if let Err(error) = io::stdout().flush() {
         eprintln!("[error] failed to flush stdout: {error}\n");
         return;
@@ -225,19 +260,186 @@ fn handle_write(project: &ProjectInfo, rel_path: &str) {
         return;
     }
 
-    match tools::write_file(&project.root, rel_path, &content) {
+    match tools::write_file(prepared) {
         Ok(outcome) if !outcome.changed => {
-            println!("Файл уже содержит ожидаемое содержимое; запись не выполнялась.\n");
+            println!("Изменений нет; запись не выполнялась.\n");
         }
         Ok(outcome) => {
-            println!("Файл записан и проверен: {rel_path}");
+            println!("write_file completed:");
+            let shown_path = outcome
+                .path
+                .strip_prefix(&project.root)
+                .unwrap_or(&outcome.path);
+            println!("  path: {}", shown_path.display());
+            println!("  bytes written: {}", outcome.bytes_written);
+            println!(
+                "  verification: {}",
+                if outcome.verified { "passed" } else { "failed" }
+            );
             if let Some(backup_path) = outcome.backup_path {
                 let shown_path = backup_path
                     .strip_prefix(&project.root)
                     .unwrap_or(&backup_path);
-                println!("Резервная копия: {}", shown_path.display());
+                println!("  backup: {}", shown_path.display());
             }
-            println!("Audit log: .kaic/write-audit.log\n");
+            println!("  audit log: .kaic/write-audit.log\n");
+        }
+        Err(error) => eprintln!("[error] {error:#}\n"),
+    }
+}
+
+fn handle_create_file(project: &ProjectInfo, rel_path: &str) {
+    if rel_path.is_empty() {
+        eprintln!("[error] usage: /create-file <relative file path>\n");
+        return;
+    }
+
+    println!(
+        "Введите содержимое нового файла. Отдельная строка /end завершает ввод, \
+         /cancel отменяет операцию."
+    );
+    let mut content = String::new();
+
+    loop {
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => {
+                println!("\nСоздание файла отменено: получен EOF.\n");
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("[error] failed to read file content: {error}\n");
+                return;
+            }
+        }
+
+        let marker = line.trim_end_matches(['\r', '\n']);
+        match marker {
+            "/end" => break,
+            "/cancel" => {
+                println!("Создание файла отменено.\n");
+                return;
+            }
+            _ => content.push_str(&line),
+        }
+    }
+
+    let prepared = match tools::prepare_create_file(&project.root, rel_path, &content) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("[error] {error:#}\n");
+            return;
+        }
+    };
+
+    println!(
+        "\n--- create_file diff ---\n{}--- end diff ---\n",
+        prepared.diff()
+    );
+    print!(
+        "Применить показанный diff и создать \"{rel_path}\" ({} байт)? [y/N] ",
+        prepared.bytes_to_write()
+    );
+    if let Err(error) = io::stdout().flush() {
+        eprintln!("[error] failed to flush stdout: {error}\n");
+        return;
+    }
+
+    let mut confirmation = String::new();
+    match io::stdin().read_line(&mut confirmation) {
+        Ok(0) => {
+            println!("\nСоздание файла отменено: получен EOF.\n");
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("[error] failed to read confirmation: {error}\n");
+            return;
+        }
+    }
+    let confirmation = confirmation.trim().to_ascii_lowercase();
+    if confirmation != "y" && confirmation != "yes" {
+        println!("Создание файла отменено.\n");
+        return;
+    }
+
+    match tools::create_file(prepared) {
+        Ok(outcome) => {
+            let shown_path = outcome
+                .path
+                .strip_prefix(&project.root)
+                .unwrap_or(&outcome.path);
+            println!("create_file completed:");
+            println!("  path: {}", shown_path.display());
+            println!("  bytes written: {}", outcome.bytes_written);
+            println!(
+                "  verification: {}",
+                if outcome.verified { "passed" } else { "failed" }
+            );
+            println!("  backup: not required");
+            println!("  audit log: .kaic/write-audit.log\n");
+        }
+        Err(error) => eprintln!("[error] {error:#}\n"),
+    }
+}
+
+fn handle_create_directory(project: &ProjectInfo, rel_path: &str) {
+    if rel_path.is_empty() {
+        eprintln!("[error] usage: /create-directory <relative directory path>\n");
+        return;
+    }
+
+    let prepared = match tools::prepare_create_directory(&project.root, rel_path) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("[error] {error:#}\n");
+            return;
+        }
+    };
+
+    println!(
+        "\n--- create_directory preview ---\n{}--- end preview ---\n",
+        prepared.preview()
+    );
+    print!("Создать показанную директорию? [y/N] ");
+    if let Err(error) = io::stdout().flush() {
+        eprintln!("[error] failed to flush stdout: {error}\n");
+        return;
+    }
+
+    let mut confirmation = String::new();
+    match io::stdin().read_line(&mut confirmation) {
+        Ok(0) => {
+            println!("\nСоздание директории отменено: получен EOF.\n");
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("[error] failed to read confirmation: {error}\n");
+            return;
+        }
+    }
+    let confirmation = confirmation.trim().to_ascii_lowercase();
+    if confirmation != "y" && confirmation != "yes" {
+        println!("Создание директории отменено.\n");
+        return;
+    }
+
+    match tools::create_directory(prepared) {
+        Ok(outcome) => {
+            let shown_path = outcome
+                .path
+                .strip_prefix(&project.root)
+                .unwrap_or(&outcome.path);
+            println!("create_directory completed:");
+            println!("  path: {}", shown_path.display());
+            println!(
+                "  verification: {}",
+                if outcome.verified { "passed" } else { "failed" }
+            );
+            println!("  backup: not required");
+            println!("  audit log: .kaic/write-audit.log\n");
         }
         Err(error) => eprintln!("[error] {error:#}\n"),
     }
@@ -298,6 +500,8 @@ fn print_help() {
          /read F   — прочитать файл проекта и добавить его в контекст сессии\n\
          /ls [D]   — показать содержимое директории проекта (по умолчанию — корень)\n\
          /write F  — безопасно записать файл (ввод до /end, отмена через /cancel)\n\
+         /create-file F      — создать новый файл после preview и подтверждения\n\
+         /create-directory D — создать одну директорию после подтверждения\n\
          /git-status       — показать branch и состояние working tree\n\
          /git-diff         — показать unstaged и staged изменения\n\
          /git-log          — показать последние 20 коммитов\n\

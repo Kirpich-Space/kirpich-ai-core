@@ -1,3 +1,5 @@
+mod agent;
+mod contract;
 mod core;
 mod git_diff;
 mod git_log;
@@ -49,7 +51,9 @@ fn main() -> Result<()> {
 
     let project_info = context::detect(&project_root)?;
 
-    let engine = KaicEngine::new(&config.model_path, config.n_gpu_layers)
+    // Роль REPL: диалоговая модель. Модель Planner'а (config.models.planner)
+    // здесь намеренно не трогается — она поднимается агентным слоем отдельно.
+    let engine = KaicEngine::new(&config.models.repl, config.n_gpu_layers)
         .context("не удалось инициализировать движок")?;
 
     repl::run(&engine, &config, &project_info)

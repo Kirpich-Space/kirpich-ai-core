@@ -3,6 +3,10 @@ use std::num::NonZeroU32;
 use anyhow::{Context, Result};
 use llama_cpp_4::prelude::*;
 
+/// Имя стартового правила GBNF. Соглашение llama.cpp — "root"; вынесено в
+/// константу, чтобы вызывающий не гадал, как назвать корневое правило.
+pub const GRAMMAR_ROOT_RULE: &str = "root";
+
 /// Одно сообщение диалога. Простая структура данных, а не поведение —
 /// используется и здесь, и в repl.rs (и позже будет использоваться любым
 /// будущим оркестратором/агентом), поэтому вынесена как публичный тип, а
@@ -28,6 +32,14 @@ pub struct ChatParams {
     pub temperature: f32,
     pub max_tokens: usize,
     pub context: u32,
+    /// Необязательная GBNF-грамматика, ограничивающая сэмплинг.
+    ///
+    /// Движок её не интерпретирует и не знает, кто и зачем её прислал: строка
+    /// как есть уходит в грамматический сэмплер llama.cpp. Смысл конкретной
+    /// грамматики — целиком забота вызывающего.
+    ///
+    /// `None` — путь генерации ровно тот же, что был до появления поля.
+    pub grammar: Option<String>,
 }
 
 /// KaicEngine — минимальный публичный интерфейс: new() + chat().
@@ -135,10 +147,26 @@ impl KaicEngine {
         // Seed фиксирован (0), как в проверенной версии smoke-теста — никаких
         // "улучшений" вроде динамического seed на этом этапе не вносится.
         println!("[engine] создаю sampler (temp={})...", params.temperature);
-        let sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(params.temperature),
-            LlamaSampler::dist(0),
-        ]);
+        // Грамматика ставится первой в цепочке: она обнуляет вероятность
+        // недопустимых токенов до того, как temp/dist выберут из оставшихся.
+        // Обратный порядок ничего бы не гарантировал.
+        //
+        // Ветка None собирает ровно ту же цепочку, что и до появления поля, —
+        // без грамматики поведение не меняется ни на шаг.
+        let sampler = match params.grammar.as_deref() {
+            Some(grammar) => {
+                println!("[engine] sampler с грамматикой ({} символов)", grammar.len());
+                LlamaSampler::chain_simple([
+                    LlamaSampler::grammar(&self.model, grammar, GRAMMAR_ROOT_RULE),
+                    LlamaSampler::temp(params.temperature),
+                    LlamaSampler::dist(0),
+                ])
+            }
+            None => LlamaSampler::chain_simple([
+                LlamaSampler::temp(params.temperature),
+                LlamaSampler::dist(0),
+            ]),
+        };
         println!("[engine] sampler готов");
 
         let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -171,8 +199,7 @@ impl KaicEngine {
                 .context("не удалось получить байты токена")?;
             println!("[AFTER] token_to_bytes() успешно, {} байт", bytes.len());
 
-            let mut piece = String::new();
-            decoder.decode_to_string(&bytes, &mut piece, false);
+            let piece = decode_utf8_piece(&mut decoder, &bytes, false);
             println!("[{step}] token text = {piece:?}");
             output.push_str(&piece);
 
@@ -191,7 +218,129 @@ impl KaicEngine {
             pos += 1;
         }
 
+        // Flush any incomplete UTF-8 sequence still held by the stateful decoder.
+        output.push_str(&decode_utf8_piece(&mut decoder, &[], true));
+
         println!("[engine] генерация завершена");
         Ok(output)
+    }
+}
+
+/// Incremental UTF-8 decode of one token chunk into a new `String`.
+///
+/// `encoding_rs::Decoder::decode_to_string` does **not** grow `dst`: it only
+/// writes into the capacity already reserved beyond `dst.len()`. Callers must
+/// `reserve` first (см. документацию encoding_rs). Без этого пустой
+/// `String::new()` (capacity 0) молча возвращает `CoderResult::OutputFull`,
+/// прочитав 0 байт, — то есть каждый токен превращается в пустую строку.
+///
+/// Состояние декодера намеренно живёт снаружи, между вызовами: byte-level BPE
+/// режет многобайтовый UTF-8 (кириллица — 2 байта на символ) по границе
+/// токена, и хвост незавершённой последовательности должен переноситься в
+/// следующий вызов. Последний вызов с `last=true` отдаёт то, что осталось в
+/// буфере декодера.
+///
+/// Результат `decode_to_string` не игнорируется: именно молча выброшенный
+/// `CoderResult` и был первопричиной бага, поэтому цикл дочитывает вход до
+/// `InputEmpty`, доращивая буфер, вместо того чтобы предполагать, что одного
+/// вызова всегда достаточно.
+fn decode_utf8_piece(decoder: &mut encoding_rs::Decoder, bytes: &[u8], last: bool) -> String {
+    let mut piece = String::new();
+    let mut consumed = 0usize;
+
+    loop {
+        let remaining = &bytes[consumed..];
+        let needed = decoder
+            .max_utf8_buffer_length(remaining.len())
+            .unwrap_or_else(|| remaining.len().saturating_mul(3).max(4));
+        piece.reserve(needed.max(4));
+
+        let (result, read, _had_errors) = decoder.decode_to_string(remaining, &mut piece, last);
+        consumed += read;
+
+        match result {
+            encoding_rs::CoderResult::InputEmpty => return piece,
+            // Буфера не хватило: следующая итерация зарезервирует ещё под
+            // непрочитанный остаток. read>0 гарантирует продвижение, а при
+            // read==0 растёт зарезервированная ёмкость — цикл конечен.
+            encoding_rs::CoderResult::OutputFull => continue,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_utf8_piece;
+
+    /// Прогоняет чанки ровно так, как это делает цикл генерации: один
+    /// stateful-декодер на весь проход, по вызову на токен, финальный flush.
+    fn decode_stream(chunks: &[&[u8]]) -> String {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut output = String::new();
+        for chunk in chunks {
+            output.push_str(&decode_utf8_piece(&mut decoder, chunk, false));
+        }
+        output.push_str(&decode_utf8_piece(&mut decoder, &[], true));
+        output
+    }
+
+    #[test]
+    fn decode_utf8_piece_reassembles_split_cyrillic() {
+        // "Я" в UTF-8 — D0 AF; byte-level BPE регулярно режет такой символ
+        // ровно по этой границе, отдавая по одному байту на токен.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let first = decode_utf8_piece(&mut decoder, &[0xD0], false);
+        let second = decode_utf8_piece(&mut decoder, &[0xAF], false);
+        let flush = decode_utf8_piece(&mut decoder, &[], true);
+
+        assert_eq!(first, "", "неполный ведущий байт обязан остаться в буфере");
+        assert_eq!(second, "Я");
+        assert_eq!(flush, "");
+        assert_eq!(format!("{first}{second}{flush}"), "Я");
+    }
+
+    #[test]
+    fn decode_stream_recovers_phrase_split_at_every_byte() {
+        // Худший случай: каждый байт приходит отдельным токеном.
+        let phrase = "STATUS: READY — план готов ✅";
+        let chunks: Vec<&[u8]> = phrase.as_bytes().chunks(1).collect();
+
+        assert_eq!(decode_stream(&chunks), phrase);
+    }
+
+    #[test]
+    fn decode_stream_handles_realistic_multibyte_chunking() {
+        // Границы токенов, попадающие внутрь 2- и 3-байтовых символов.
+        let phrase = "Прочитать src/repl.rs";
+        let bytes = phrase.as_bytes();
+        let chunks: Vec<&[u8]> = vec![&bytes[..1], &bytes[1..5], &bytes[5..14], &bytes[14..]];
+
+        assert_eq!(decode_stream(&chunks), phrase);
+    }
+
+    #[test]
+    fn final_flush_emits_dangling_partial_sequence() {
+        // Генерация оборвалась на max_tokens посреди символа. Без вызова с
+        // last=true этот байт остался бы в декодере и потерялся молча.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let piece = decode_utf8_piece(&mut decoder, &[0xD0], false);
+        let flush = decode_utf8_piece(&mut decoder, &[], true);
+
+        assert_eq!(piece, "");
+        assert_eq!(flush, "\u{FFFD}", "flush обязан отдать хвост буфера");
+    }
+
+    #[test]
+    fn decode_utf8_piece_empty_capacity_would_drop_bytes_without_reserve() {
+        // Первопричина бага, зафиксированная как исполняемый факт:
+        // decode_to_string в String::new() (capacity 0) не пишет ничего и не
+        // читает ни байта даже для чистого ASCII — просто OutputFull.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut piece = String::new();
+        let (result, read, _) = decoder.decode_to_string(b"ok", &mut piece, false);
+
+        assert!(piece.is_empty());
+        assert_eq!(read, 0);
+        assert!(matches!(result, encoding_rs::CoderResult::OutputFull));
     }
 }
