@@ -118,6 +118,59 @@ impl Scheduler {
 
     /// Загружает все `always_loaded` модели при старте системы
     /// и отмечает их как резидентные. Вызывается один раз в `main.rs`.
+    /// Выгружает всё, что осталось в backend'е от прошлых запусков.
+    ///
+    /// Вызывается на старте, ДО `preload_always_loaded`. Причина не в
+    /// аккуратности, а в наблюдённом отказе: `preload_always_loaded` грузит
+    /// always_loaded-модели при каждом запуске, парной выгрузки при
+    /// завершении процесса нет, и после нескольких перезапусков в LM Studio
+    /// накопилось шесть инстансов одной модели — седьмой уже не влез, и
+    /// backend перестал стартовать вовсе.
+    ///
+    /// Чистка сделана на СТАРТЕ, а не на выходе, потому что выход бывает
+    /// разный: Ctrl+C, kill из диспетчера, краш, отключение питания. Ни один
+    /// из них не обязан выполнить наш код. Стартовая чистка не зависит от
+    /// того, как завершился прошлый процесс, — она разбирается со
+    /// следствием, а не пытается перехватить все причины.
+    ///
+    /// Идемпотентна: на чистом backend'е ничего не находит и молча выходит.
+    ///
+    /// Ошибка перечисления не считается фатальной — backend может не уметь
+    /// перечислять инстансы. В этом случае мы просто теряем чистку, а не
+    /// возможность работать.
+    pub async fn unload_stale_instances(&self) -> Result<()> {
+        let instances = match self.backend.loaded_instances().await {
+            Ok(instances) => instances,
+            Err(err) => {
+                tracing::warn!("не удалось получить список загруженных инстансов: {err:#}");
+                return Ok(());
+            }
+        };
+
+        if instances.is_empty() {
+            tracing::info!("стартовая чистка: посторонних инстансов нет");
+            return Ok(());
+        }
+
+        tracing::info!(
+            "стартовая чистка: найдено {} инстансов от прошлых запусков, выгружаю",
+            instances.len()
+        );
+        for instance in &instances {
+            match self.backend.unload_instance(instance).await {
+                Ok(()) => tracing::info!("выгружен инстанс '{instance}'"),
+                // Один упрямый инстанс не должен мешать старту: остальные
+                // всё равно освободят память.
+                Err(err) => tracing::warn!("не удалось выгрузить '{instance}': {err:#}"),
+            }
+        }
+
+        // Внутренний учёт тоже обнуляем: он описывал состояние, которого
+        // больше нет.
+        self.loaded.lock().await.clear();
+        Ok(())
+    }
+
     pub async fn preload_always_loaded(&self) -> Result<()> {
         // Проверяем ещё до первого вызова backend.load(), что always_loaded
         // модели вообще помещаются в доступную VRAM — иначе ошибка всплыла бы
@@ -135,7 +188,7 @@ impl Scheduler {
         let mut loaded = self.loaded.lock().await;
         for model in self.resource_registry.always_loaded_models() {
             self.backend
-                .load(model)
+                .load(self.resource_registry.provider_key(model))
                 .await
                 .map_err(|e| anyhow!("не удалось загрузить always_loaded модель {model}: {e}"))?;
             loaded.insert(
@@ -168,9 +221,78 @@ impl Scheduler {
         };
 
         match self.select_model(category, allow_manual).await {
-            SchedulerResult::Ready(model_id) => self.backend.generate(&model_id, request).await,
+            SchedulerResult::Ready(model_id) => {
+                // Единственное место, где известно, какая модель в итоге
+                // взяла задачу — значит и temperature подставлять здесь.
+                let request = self.with_registry_temperature(&model_id, request);
+                let provider_key = self.resource_registry.provider_key(&model_id);
+                self.backend.generate(provider_key, request).await
+            }
             SchedulerResult::Failed(reason) => Err(anyhow!(reason)),
         }
+    }
+
+    /// Выполняет запрос НАЗВАННОЙ моделью, минуя подбор по категории.
+    ///
+    /// Нужен для служебных шагов, у которых нет собственной категории и не
+    /// должно быть: извлечение поискового термина для медиа-пайплайна — это
+    /// не «задача пользователя», а деталь одной задачи. Заводить под неё
+    /// строку в Capability Registry значило бы засорять реестр служебными
+    /// сущностями.
+    ///
+    /// Размещение в памяти идёт по тем же правилам, что и обычный подбор
+    /// (`fit_and_load` + LRU), поэтому модель не может занять VRAM в обход
+    /// общего учёта.
+    pub async fn run_with_model(
+        &self,
+        model_label: &str,
+        request: GenerateRequest,
+    ) -> Result<GenerateResponse> {
+        let Ok(_guard) = self.gpu_lock.try_lock() else {
+            return Err(anyhow!("GPU сейчас занят другой задачей, повторите позже"));
+        };
+
+        let Some(resource) = self.resource_registry.get(model_label) else {
+            return Err(anyhow!(
+                "модель '{model_label}' отсутствует в Resource Registry"
+            ));
+        };
+
+        {
+            let mut loaded = self.loaded.lock().await;
+            match loaded.get_mut(model_label) {
+                Some(usage) => usage.last_used = Utc::now(),
+                None => {
+                    if !self
+                        .fit_and_load(model_label, resource.vram_mb, &mut loaded)
+                        .await
+                    {
+                        return Err(anyhow!(
+                            "не удалось разместить модель '{model_label}' в VRAM"
+                        ));
+                    }
+                }
+            }
+        }
+
+        let request = self.with_registry_temperature(model_label, request);
+        let provider_key = self.resource_registry.provider_key(model_label);
+        self.backend.generate(provider_key, request).await
+    }
+
+    /// Проставляет temperature из реестра, если вызывающий не задал свою.
+    ///
+    /// `None` в реестре означает «не задана» — поле останется `None` и
+    /// не попадёт в JSON вовсе, сохраняя умолчание провайдера.
+    fn with_registry_temperature(
+        &self,
+        model_label: &str,
+        mut request: GenerateRequest,
+    ) -> GenerateRequest {
+        if request.temperature.is_none() {
+            request.temperature = self.resource_registry.temperature_for(model_label);
+        }
+        request
     }
 
     /// Подбирает и при необходимости загружает модель для категории задачи.
@@ -246,7 +368,12 @@ impl Scheduler {
 
             match self.pick_eviction_victim(loaded) {
                 Some(victim) => {
-                    if self.backend.unload(&victim).await.is_err() {
+                    if self
+                        .backend
+                        .unload(self.resource_registry.provider_key(&victim))
+                        .await
+                        .is_err()
+                    {
                         tracing::warn!("не удалось выгрузить модель '{victim}' для освобождения VRAM");
                         return false;
                     }
@@ -274,7 +401,12 @@ impl Scheduler {
     }
 
     async fn load_and_track(&self, candidate: &str, loaded: &mut HashMap<ModelId, ModelUsage>) -> bool {
-        if self.backend.load(candidate).await.is_err() {
+        if self
+            .backend
+            .load(self.resource_registry.provider_key(candidate))
+            .await
+            .is_err()
+        {
             tracing::warn!("не удалось загрузить модель '{candidate}'");
             return false;
         }

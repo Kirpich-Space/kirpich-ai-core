@@ -63,6 +63,14 @@ export interface ModelStatusDto {
   preferred_device: 'gpu' | 'cpu' | 'hybrid';
   loaded: boolean;
   last_used: string | null;
+  /** Длина контекста загруженной модели. Параметр ЗАГРУЗКИ: смена требует
+   *  перезагрузки модели. null — не измерено (модель не грузится на этой машине). */
+  context_length: number | null;
+  /** Потолок контекста, заявленный моделью. Известен без загрузки. */
+  max_context_length: number | null;
+  /** Температура сэмплинга. Параметр ВЫЗОВА, перезагрузка не нужна.
+   *  null — не задана, действует умолчание провайдера. */
+  temperature: number | null;
 }
 
 interface LoadedModelDto {
@@ -76,6 +84,13 @@ export interface StatusDto {
   used_vram_mb: number;
   loaded_models: LoadedModelDto[];
 }
+
+/** Допустимый диапазон temperature. Держится в одном месте с backend'ом
+ *  (TEMPERATURE_MIN/TEMPERATURE_MAX в resource_registry.rs): нижняя граница —
+ *  ограничение провайдера, верхняя — наше решение. Проверка в UI существует
+ *  ради понятной ошибки до сети; гарантией остаётся проверка на маршруте API. */
+export const TEMPERATURE_MIN = 0;
+export const TEMPERATURE_MAX = 2;
 
 // --- Обработка ошибок ---
 
@@ -151,4 +166,17 @@ export const controlCenter = {
 
   /** GET /status — сводное состояние Scheduler'а (VRAM, загруженные модели). */
   getStatus: (): Promise<StatusDto> => request<StatusDto>('/status'),
+
+  /** POST /models/:name/temperature — задать температуру модели.
+   *  Диапазон значения — TEMPERATURE_MIN..TEMPERATURE_MAX; проверка здесь
+   *  не делается, её обязан делать вызывающий (см. TemperatureCell) и,
+   *  окончательно, backend.
+   *  `null` — снять настройку: поле перестанет отправляться провайдеру,
+   *  и снова начнёт действовать его умолчание. Модель не обязана быть
+   *  загружена. Возвращает обновлённый список моделей. */
+  setModelTemperature: (name: string, temperature: number | null): Promise<ModelStatusDto[]> =>
+    request<ModelStatusDto[]>(`/models/${encodeURIComponent(name)}/temperature`, {
+      method: 'POST',
+      body: JSON.stringify({ temperature }),
+    }),
 };

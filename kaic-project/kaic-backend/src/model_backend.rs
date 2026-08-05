@@ -49,6 +49,12 @@ pub struct Message {
 /// паузы на решение пользователя.
 pub struct GenerateRequest {
     pub messages: Vec<Message>,
+
+    /// Температура сэмплинга. `None` — поле НЕ отправляется провайдеру
+    /// вообще, и действует его умолчание. Это важное свойство, а не
+    /// деталь: до появления этого поля backend никогда не слал
+    /// temperature, и `None` обязан сохранять ровно прежнее поведение.
+    pub temperature: Option<f32>,
 }
 
 /// Ответ модели.
@@ -77,6 +83,32 @@ pub trait ModelBackend: Send + Sync {
     /// Модель должна быть загружена заранее (см. `load`) — этот метод
     /// сам загрузку не делает, это забота Scheduler'а.
     async fn generate(&self, model: &str, request: GenerateRequest) -> Result<GenerateResponse>;
+
+    /// Идентификаторы ВСЕХ инстансов, загруженных в backend прямо сейчас,
+    /// включая те, о которых текущий процесс ничего не знает.
+    ///
+    /// Нужен для стартовой чистки: после аварийного завершения (Ctrl+C, kill,
+    /// краш) в backend остаются загруженные модели, а наш учёт при этом
+    /// начинается с нуля. Без перечисления мы не можем узнать, что осталось.
+    ///
+    /// По умолчанию — пустой список: backend вправе не уметь перечислять,
+    /// и тогда чистка просто ничего не найдёт.
+    async fn loaded_instances(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Выгружает конкретный инстанс по его идентификатору.
+    ///
+    /// Отличается от `unload` тем, что оперирует идентификатором инстанса, а
+    /// не именем модели: одна и та же модель может быть загружена несколько
+    /// раз (`model`, `model:2`, `model:3`), и по имени модели выгрузится
+    /// только первый.
+    ///
+    /// По умолчанию делегирует в `unload` — для backend'ов, где инстанс и
+    /// модель это одно и то же.
+    async fn unload_instance(&self, instance_id: &str) -> Result<()> {
+        self.unload(instance_id).await
+    }
 }
 
 /// Реализация `ModelBackend` поверх LM Studio.
@@ -164,6 +196,38 @@ impl ModelBackend for LmStudioBackend {
         Ok(())
     }
 
+    async fn loaded_instances(&self) -> Result<Vec<String>> {
+        let url = format!("{}/api/v1/models", self.base_url);
+        let response: ModelsListResponse = self
+            .auth(self.client.get(&url))
+            .send()
+            .await
+            .context("не удалось связаться с LM Studio")?
+            .error_for_status()
+            .context("LM Studio вернула ошибку при списке моделей")?
+            .json()
+            .await
+            .context("не удалось разобрать ответ LM Studio")?;
+
+        Ok(response
+            .models
+            .into_iter()
+            .flat_map(|m| m.loaded_instances.into_iter().map(|i| i.id))
+            .collect())
+    }
+
+    async fn unload_instance(&self, instance_id: &str) -> Result<()> {
+        let url = format!("{}/api/v1/models/unload", self.base_url);
+        self.auth(self.client.post(&url))
+            .json(&UnloadRequest { instance_id })
+            .send()
+            .await
+            .context("не удалось отправить запрос на выгрузку инстанса")?
+            .error_for_status()
+            .context("LM Studio отказала в выгрузке инстанса")?;
+        Ok(())
+    }
+
     async fn unload(&self, model: &str) -> Result<()> {
         // instance_id, который вернула LM Studio при загрузке — не обязан
         // совпадать с ключом модели (см. документацию). Если по какой-то
@@ -205,7 +269,11 @@ impl ModelBackend for LmStudioBackend {
             })
             .collect();
 
-        let body = ChatCompletionsRequest { model, messages };
+        let body = ChatCompletionsRequest {
+            model,
+            messages,
+            temperature: request.temperature,
+        };
 
         let response: ChatCompletionsResponse = self
             .auth(self.client.post(&url))
@@ -276,6 +344,48 @@ struct WireMessage<'a> {
 struct ChatCompletionsRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
+    /// `skip_serializing_if` здесь не косметика: если сериализовать
+    /// `null`, LM Studio получит явное «температура не задана числом» и
+    /// ответит ошибкой схемы. Поле должно ИСЧЕЗАТЬ из JSON целиком.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    fn body(temperature: Option<f32>) -> serde_json::Value {
+        serde_json::to_value(ChatCompletionsRequest {
+            model: "any",
+            messages: vec![WireMessage { role: "user", content: "привет" }],
+            temperature,
+        })
+        .expect("запрос сериализуется")
+    }
+
+    #[test]
+    fn temperature_none_is_absent_from_request_body() {
+        // Главная гарантия задачи: при `None` умолчание провайдера должно
+        // сохраниться в точности, а для этого ключа не должно быть ВООБЩЕ —
+        // `"temperature": null` LM Studio считает ошибкой схемы.
+        // Живой прогон это подтверждал, но рефакторинг снял бы
+        // `skip_serializing_if` молча — отсюда тест.
+        let json = body(None);
+        assert!(
+            json.get("temperature").is_none(),
+            "ключ temperature присутствует: {json}"
+        );
+    }
+
+    #[test]
+    fn temperature_some_is_present_in_request_body() {
+        let json = body(Some(0.7));
+        assert_eq!(
+            json.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.7_f32 as f64)
+        );
+    }
 }
 
 #[derive(Deserialize)]
