@@ -1,61 +1,86 @@
 # Resource Registry — ресурсные характеристики моделей для Scheduler.
 # В отличие от capability_registry.yaml, здесь не "что модель умеет",
-# а "сколько она стоит": VRAM, RAM при offload, время загрузки.
+# а "сколько она стоит": память под модель и время загрузки.
 #
-# vram_mb — реальное потребление VRAM при текущей конфигурации загрузки
-# (уже с учётом offload, если он используется). Именно это число Scheduler
-# использует при решении, поместится ли модель в свободную память.
+# vram_mb — ПОЛНЫЙ (max) footprint модели, а не наблюдавшееся потребление.
+# Имя историческое и осталось от времён, когда бюджет равнялся видеопамяти;
+# сегодня число сравнивается с TOTAL_MODEL_MEMORY_MB (main.rs) — всей
+# памятью машины, отданной моделям, за вычетом резерва под ОС.
+#
+# Получается командой:
+#
+#     lms load <lm_studio_key> --gpu max --estimate-only
+#
+# Она печатает "Estimated Total Memory: N GiB"; в файл идёт N × 1024.
+# Оценка не зависит от того, что загружено в LM Studio в момент замера
+# (проверено контрольным замером одной модели при загруженном соседе и на
+# пустом LM Studio — числа совпали), поэтому очищать память перед замером
+# не нужно.
 #
 # ram_offload_mb — диагностика для GUI/логов, Scheduler это число
 # в решениях не использует.
 #
 # path — опционально. Нужен только моделям, которые загружает встроенный
 # backend (EmbeddedBackend, поверх llama.cpp) напрямую по пути к файлу.
-# Модели, которые обслуживает LMStudioBackend, обращаются по имени через
+# Модели, которые обслуживает LMStudioBackend, обращаются по ключу через
 # LM Studio и это поле не заполняют — как показано ниже.
 #
-# Оценки под RTX 4060 (8GB VRAM) + 32GB DDR4. Значения приблизительные —
-# уточняются по факту использования.
+# ВНИМАНИЕ. Числа ниже — НЕ значения по умолчанию и не оценки "на глаз".
+# Это реальные замеры с машины разработчика (RTX 4060 8 GiB + 32 GiB DDR4,
+# 2026-08-07), приведённые как образец формата и порядка величин. На вашей
+# машине footprint тех же моделей будет другим — квантование, версия
+# LM Studio и размер контекста меняют его. Перезамерьте командой выше,
+# прежде чем полагаться на планирование.
+#
+# Плейсхолдеры вместо чисел здесь невозможны: vram_mb обязателен и должен
+# быть числом. Ноль как "заполню потом" не ставить ни при каких условиях —
+# модель с нулём проходит любой бюджет и ломает планирование молча.
+# Именно так этот файл и ошибался раньше.
+
+# always_loaded — модель не подлежит вытеснению по LRU и занимает бюджет
+# постоянно. Сумма always_loaded-моделей обязана помещаться в бюджет,
+# иначе backend откажется стартовать.
+Fable9B:
+  lm_studio_key: qwable-9b-claude-fable-5-obliterated-i1
+  vram_mb: 5734 # 5.60 GiB
+  load_seconds: 9
+  always_loaded: true
+  preferred_device: gpu
 
 Nemotron:
-  vram_mb: 3000
-  load_seconds: 2
-  always_loaded: true
+  lm_studio_key: nvidia/nemotron-3-nano-omni
+  vram_mb: 25723 # 25.12 GiB
+  load_seconds: 34
   preferred_device: gpu
 
-Fable9B:
-  vram_mb: 6000
-  load_seconds: 5
-  always_loaded: true
-  preferred_device: gpu
+GPTOSS20:
+  lm_studio_key: openai/gpt-oss-20b
+  vram_mb: 12073 # 11.79 GiB
+  ram_offload_mb: 11300
+  load_seconds: 435
+  preferred_device: cpu
 
 GLM47:
-  vram_mb: 8000
-  ram_offload_mb: 2000
+  lm_studio_key: zai-org/glm-4.7-flash
+  vram_mb: 17860 # 17.44 GiB
   load_seconds: 15
   preferred_device: hybrid
 
-GPTOSS20:
-  vram_mb: 8000
-  ram_offload_mb: 10000
-  load_seconds: 30
-  preferred_device: hybrid
-
 Gemma27:
-  vram_mb: 8000
-  ram_offload_mb: 14000
+  lm_studio_key: google/gemma-4-26b-a4b
+  vram_mb: 17848 # 17.43 GiB
   load_seconds: 40
   preferred_device: hybrid
 
 GLM51:
-  vram_mb: 8000
-  ram_offload_mb: 14000
+  lm_studio_key: q3.6-27b-glm-5.1-da
+  vram_mb: 17654 # 17.24 GiB
   load_seconds: 40
   preferred_device: hybrid
 
 Qwen40B:
-  vram_mb: 8000
-  ram_offload_mb: 22000
+  lm_studio_key: qwen3.6-40b-claude-4.6-opus-deckard-heretic-uncensored-thinking-neo-code-di-imatrix-max
+  vram_mb: 26307 # 25.69 GiB
   load_seconds: 90
   preferred_device: hybrid
 
