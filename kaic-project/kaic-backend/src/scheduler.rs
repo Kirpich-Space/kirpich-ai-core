@@ -37,6 +37,35 @@ use crate::resource_registry::ResourceRegistry;
 /// Имя модели, используемое как идентификатор в Model Backend.
 pub type ModelId = String;
 
+/// Помещается ли модель в бюджет памяти.
+///
+/// ЕДИНСТВЕННОЕ место, где живёт это правило. Его вызывают двое: реальное
+/// размещение (`fit_and_load`) и стартовая диагностика (`reachability`).
+/// Диагностика обязана отвечать ровно то же, что решит Scheduler, — иначе
+/// она начнёт врать, а врущая диагностика хуже её отсутствия.
+fn fits_in_budget(used_mb: u32, needed_mb: u32, budget_mb: u32) -> bool {
+    used_mb + needed_mb <= budget_mb
+}
+
+/// Что система реально может при текущем бюджете и реестре.
+///
+/// Считается один раз при старте. Все выводы получены через
+/// `fits_in_budget` — той же функцией, которой Scheduler принимает решения.
+pub struct ReachabilityReport {
+    pub budget_mb: u32,
+    /// Сколько бюджета занято резидентами постоянно: они исключены из
+    /// вытеснения, поэтому это пол, ниже которого свободная память не растёт.
+    pub resident_mb: u32,
+    /// Модели, которые не помещаются в бюджет даже поверх одних резидентов,
+    /// то есть не могут быть выбраны никогда. Имя и его `vram_mb`.
+    pub unreachable: Vec<(String, u32)>,
+    /// Категории, у которых ни один кандидат из цепочки не проходит.
+    pub empty_categories: Vec<String>,
+    /// Категории, которые обслуживает не primary, а fallback:
+    /// (категория, назначенная модель, фактическая).
+    pub served_by_fallback: Vec<(String, String, String)>,
+}
+
 /// Результат подбора модели для категории задачи.
 enum SchedulerResult {
     /// Модель выбрана и загружена, можно генерировать ответ.
@@ -105,6 +134,122 @@ impl Scheduler {
     /// (для отображения в Control Center).
     pub fn total_model_memory_mb(&self) -> u32 {
         self.total_model_memory_mb
+    }
+
+    /// Что система может при текущем бюджете: какие модели недостижимы,
+    /// какие категории пусты, какие обслуживаются не своей моделью.
+    ///
+    /// Ничего не меняет и ни на что не влияет — только читает реестры.
+    /// Выяснение этих двух фактов вручную занимало по отдельной задаче
+    /// каждый раз; система знает их сама и обязана сказать.
+    ///
+    /// Проверка вместимости идёт через `fits_in_budget` — ту же функцию,
+    /// которой пользуется `fit_and_load`, а не через её копию.
+    pub fn reachability(&self) -> ReachabilityReport {
+        let resident_mb = self.resource_registry.always_loaded_vram_mb();
+
+        // Достижима ли модель в принципе: резиденты вытеснению не подлежат,
+        // поэтому лучший возможный случай для любой модели — она одна поверх
+        // резидентов. Сами резиденты меряются относительно остальных
+        // резидентов, иначе модель считалась бы конкурентом самой себе.
+        let is_reachable = |name: &str, entry: &crate::resource_registry::ResourceEntry| {
+            let floor = if entry.always_loaded {
+                resident_mb.saturating_sub(entry.vram_mb)
+            } else {
+                resident_mb
+            };
+            let _ = name;
+            fits_in_budget(floor, entry.vram_mb, self.total_model_memory_mb)
+        };
+
+        let mut unreachable: Vec<(String, u32)> = self
+            .resource_registry
+            .all()
+            .filter(|(name, entry)| !is_reachable(name, entry))
+            .map(|(name, entry)| (name.clone(), entry.vram_mb))
+            .collect();
+        unreachable.sort_by_key(|(_, mb)| std::cmp::Reverse(*mb));
+
+        let mut empty_categories = Vec::new();
+        let mut served_by_fallback = Vec::new();
+
+        let mut categories = self.capability_registry.categories();
+        categories.sort_unstable();
+
+        for category in categories {
+            let candidates = self.capability_registry.candidates(category);
+            let primary = candidates.first().map(|s| s.to_string());
+
+            let winner = candidates.iter().find(|candidate| {
+                self.resource_registry
+                    .get(candidate)
+                    .is_some_and(|entry| is_reachable(candidate, entry))
+            });
+
+            match (winner, primary) {
+                (None, _) => empty_categories.push(category.to_string()),
+                (Some(actual), Some(primary)) if **actual != primary => {
+                    served_by_fallback.push((category.to_string(), primary, actual.to_string()));
+                }
+                _ => {}
+            }
+        }
+
+        ReachabilityReport {
+            budget_mb: self.total_model_memory_mb,
+            resident_mb,
+            unreachable,
+            empty_categories,
+            served_by_fallback,
+        }
+    }
+
+    /// Печатает отчёт о достижимости в лог запуска.
+    ///
+    /// Только сообщение: старт не блокируется, поведение подбора модели
+    /// не меняется. Если всё достижимо — одна строка, а не тишина: тишину
+    /// нельзя отличить от «диагностика не отработала».
+    pub fn log_reachability(&self) {
+        let report = self.reachability();
+
+        tracing::info!(
+            "== достижимость == бюджет {} MB, из них {} MB заняты резидентами постоянно \
+             (свободно под задачу: {} MB)",
+            report.budget_mb,
+            report.resident_mb,
+            report.budget_mb.saturating_sub(report.resident_mb),
+        );
+
+        if report.unreachable.is_empty() {
+            tracing::info!("== достижимость == все модели реестра достижимы");
+        } else {
+            for (name, mb) in &report.unreachable {
+                tracing::warn!(
+                    "== достижимость == модель '{name}' НЕДОСТИЖИМА: {mb} MB + {} MB резидентов \
+                     > {} MB бюджета",
+                    report.resident_mb,
+                    report.budget_mb,
+                );
+            }
+        }
+
+        for category in &report.empty_categories {
+            tracing::warn!(
+                "== достижимость == категория '{category}' ПУСТА: ни один кандидат цепочки \
+                 не проходит, задачи в ней будут падать"
+            );
+        }
+
+        for (category, primary, actual) in &report.served_by_fallback {
+            tracing::warn!(
+                "== достижимость == категория '{category}' обслуживается fallback'ом \
+                 '{actual}', а не назначенной '{primary}'"
+            );
+        }
+
+        if report.empty_categories.is_empty() && report.served_by_fallback.is_empty() {
+            tracing::info!("== достижимость == все категории обслуживаются назначенными моделями");
+        }
     }
 
     /// Возвращает список моделей, которые Scheduler считает загруженными
@@ -365,7 +510,7 @@ impl Scheduler {
                 .map(|r| r.vram_mb)
                 .sum();
 
-            if used_memory_mb + needed_memory_mb <= self.total_model_memory_mb {
+            if fits_in_budget(used_memory_mb, needed_memory_mb, self.total_model_memory_mb) {
                 return self.load_and_track(candidate, loaded).await;
             }
 
@@ -466,9 +611,15 @@ mod budget_tests {
 
     /// Резидент на 6000 и два кандидата: один влезает поверх него, другой нет.
     fn scheduler_with_budget(budget_mb: u32) -> (Scheduler, PathBuf) {
+        // Счётчик, а не бюджет, в имени каталога: тесты идут параллельно, и
+        // два вызова с одинаковым бюджетом делили бы один каталог — один
+        // удалял бы файлы из-под другого.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "kaic-budget-{}-{budget_mb}",
-            std::process::id()
+            "kaic-budget-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -540,6 +691,44 @@ Heaviest:
             panic!("кандидат '{model}' не помещается вместе с резидентом, но был выбран");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Диагностика обязана отвечать то же, что решит Scheduler. Числа
+    /// подставные: реестр переизмеряется, и тест на реальных значениях
+    /// ломался бы при каждом замере, ничего при этом не проверяя.
+    #[tokio::test]
+    async fn reachability_names_unreachable_models_and_empty_categories() {
+        let (scheduler, dir) = scheduler_with_budget(24495);
+        let report = scheduler.reachability();
+
+        assert_eq!(report.budget_mb, 24495);
+        assert_eq!(report.resident_mb, 6000, "резидент занимает бюджет постоянно");
+
+        // 6000 резидента + 26000 = 32000 > 24495 — TooBig недостижим.
+        // 6000 + 18000 = 24000 <= 24495 — Fits достижим.
+        // Резидент меряется без себя самого: 0 + 6000 <= 24495.
+        assert_eq!(
+            report.unreachable,
+            vec![("TooBig".to_string(), 26000)],
+            "недостижим ровно тот, кто не влезает поверх резидента"
+        );
+
+        // Категория Heaviest состоит из одного TooBig — значит пуста.
+        assert_eq!(report.empty_categories, vec!["Heaviest".to_string()]);
+        // Heavy обслуживается своим primary, подмены нет.
+        assert!(report.served_by_fallback.is_empty());
+
+        // Тот же вопрос при бюджете размером с видеопамять: недостижимо всё,
+        // кроме резидента, и обе категории пусты.
+        drop(scheduler);
+        let (tight, tight_dir) = scheduler_with_budget(8000);
+        let tight_report = tight.reachability();
+        let mut empty = tight_report.empty_categories.clone();
+        empty.sort();
+        assert_eq!(empty, vec!["Heaviest".to_string(), "Heavy".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&tight_dir).ok();
     }
 
     /// Тот же кандидат при прежнем бюджете видеопамяти не проходил вообще —

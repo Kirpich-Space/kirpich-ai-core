@@ -66,7 +66,16 @@ const TOTAL_MODEL_MEMORY_MB: u32 = 24495;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // `fmt::init()` при незаданном RUST_LOG пропускает только ERROR — то есть
+    // весь info!/warn! приложения молчал, включая стартовую диагностику и
+    // предупреждения Scheduler'а о неудачных загрузках. Умолчание должно быть
+    // info: логи существуют, чтобы их читали. RUST_LOG по-прежнему главнее.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let capability_registry = Arc::new(CapabilityRegistry::from_file(
         "config/capability_registry.yaml",
@@ -88,6 +97,12 @@ async fn main() -> Result<()> {
     // загруженные модели, о которых мы ничего не знаем.
     scheduler.unload_stale_instances().await?;
     scheduler.preload_always_loaded().await?;
+
+    // Что система реально может при текущем бюджете. Только сообщение:
+    // старт не блокируется, поведение подбора не меняется. Выяснение этих
+    // фактов вручную стоило нескольких задач подряд, хотя Scheduler знает
+    // их сам с первой секунды.
+    scheduler.log_reachability();
 
     let task_store = Arc::new(TaskStore::new("kaic.db")?);
 

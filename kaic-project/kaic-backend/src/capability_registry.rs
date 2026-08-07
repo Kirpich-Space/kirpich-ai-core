@@ -75,6 +75,12 @@ impl CapabilityRegistry {
         }
     }
 
+    /// Имена всех известных категорий. Нужны стартовой диагностике, чтобы
+    /// пройти по всем цепочкам и сказать, какие из них пусты.
+    pub fn categories(&self) -> Vec<&str> {
+        self.entries.keys().map(String::as_str).collect()
+    }
+
     /// Проверяет, помечена ли категория как "только вручную"
     /// (модель не должна запускаться автоматически).
     pub fn is_manual_only(&self, category: &str) -> bool {
