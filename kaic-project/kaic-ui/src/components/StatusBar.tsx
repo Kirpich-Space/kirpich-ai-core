@@ -64,11 +64,11 @@ export default function StatusBar() {
   }
 
   const loadedNames = status?.loaded_models.map((m) => m.model) ?? [];
-  // always_loaded-модели показываем отдельно: они занимают VRAM
+  // always_loaded-модели показываем отдельно: они занимают память
   // постоянно, и это объясняет базовый уровень занятости.
   const residentCount = models.filter((m) => m.always_loaded).length;
-  const usedMb = status?.used_vram_mb ?? 0;
-  const totalMb = status?.total_vram_mb ?? 0;
+  const usedMb = status?.used_model_memory_mb ?? 0;
+  const totalMb = status?.total_model_memory_mb ?? 0;
   const percent = totalMb > 0 ? Math.round((usedMb / totalMb) * 100) : 0;
 
   return (
@@ -85,8 +85,11 @@ export default function StatusBar() {
         {offline ? '● Нет связи (данные устарели)' : '● Backend на связи'}
       </span>
 
-      <span>
-        VRAM: {usedMb} / {totalMb} MB ({percent}%)
+      {/* Не "VRAM": бюджет считает всю память, отданную моделям (RAM + VRAM
+          минус резерв под ОС). Модель может поместиться в него целиком через
+          оперативную память — и отвечать медленно. */}
+      <span title="Память под модели: RAM + VRAM минус резерв под ОС. Скорость этой величиной не моделируется.">
+        Память моделей: {usedMb} / {totalMb} MB ({percent}%)
       </span>
 
       <span>Загружено: {loadedNames.length > 0 ? loadedNames.join(', ') : '—'}</span>

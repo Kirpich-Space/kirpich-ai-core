@@ -62,8 +62,10 @@ pub struct Scheduler {
     resource_registry: Arc<ResourceRegistry>,
     backend: Arc<dyn ModelBackend>,
 
-    /// Общий объём VRAM (в мегабайтах), доступный системе.
-    total_vram_mb: u32,
+    /// Память (в мегабайтах), доступная моделям: оперативная плюс
+    /// видеопамять, за вычетом резерва под ОС. Не видеопамять — см.
+    /// обоснование у константы в main.rs.
+    total_model_memory_mb: u32,
 
     /// Единственная блокировка на весь цикл `run()`: подбор модели
     /// (включая возможную загрузку/вытеснение) и сама генерация —
@@ -81,27 +83,28 @@ pub struct Scheduler {
 impl Scheduler {
     /// Создаёт Scheduler.
     ///
-    /// `total_vram_mb` — объём видеопамяти на конкретной машине
-    /// (например 8000 для RTX 4060).
+    /// `total_model_memory_mb` — сколько памяти машины отдано моделям
+    /// (RAM + VRAM минус резерв под ОС), а НЕ объём видеопамяти.
     pub fn new(
         capability_registry: Arc<CapabilityRegistry>,
         resource_registry: Arc<ResourceRegistry>,
         backend: Arc<dyn ModelBackend>,
-        total_vram_mb: u32,
+        total_model_memory_mb: u32,
     ) -> Self {
         Self {
             capability_registry,
             resource_registry,
             backend,
-            total_vram_mb,
+            total_model_memory_mb,
             gpu_lock: Mutex::new(()),
             loaded: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Общий объём VRAM, известный Scheduler'у (для отображения в Control Center).
-    pub fn total_vram_mb(&self) -> u32 {
-        self.total_vram_mb
+    /// Бюджет памяти под модели, известный Scheduler'у
+    /// (для отображения в Control Center).
+    pub fn total_model_memory_mb(&self) -> u32 {
+        self.total_model_memory_mb
     }
 
     /// Возвращает список моделей, которые Scheduler считает загруженными
@@ -173,15 +176,15 @@ impl Scheduler {
 
     pub async fn preload_always_loaded(&self) -> Result<()> {
         // Проверяем ещё до первого вызова backend.load(), что always_loaded
-        // модели вообще помещаются в доступную VRAM — иначе ошибка всплыла бы
+        // модели вообще помещаются в бюджет — иначе ошибка всплыла бы
         // только как сырой отказ от LM Studio при загрузке, а тут причина
         // видна сразу и явно.
         let required = self.resource_registry.always_loaded_vram_mb();
-        if required > self.total_vram_mb {
+        if required > self.total_model_memory_mb {
             return Err(anyhow!(
-                "always_loaded модели требуют {required} MB VRAM, \
-                 а доступно только {} MB — проверьте resource_registry.yaml",
-                self.total_vram_mb
+                "always_loaded модели требуют {required} MB памяти, \
+                 а бюджет всего {} MB — проверьте resource_registry.yaml",
+                self.total_model_memory_mb
             ));
         }
 
@@ -346,23 +349,23 @@ impl Scheduler {
         ))
     }
 
-    /// Пытается разместить модель `candidate` в VRAM: сначала без вытеснения,
-    /// затем вытесняя по LRU (никогда не трогая always_loaded), пока либо
-    /// не найдётся места, либо вытеснять больше нечего.
+    /// Пытается разместить модель `candidate` в бюджете памяти: сначала без
+    /// вытеснения, затем вытесняя по LRU (никогда не трогая always_loaded),
+    /// пока либо не найдётся места, либо вытеснять больше нечего.
     async fn fit_and_load(
         &self,
         candidate: &str,
-        needed_vram_mb: u32,
+        needed_memory_mb: u32,
         loaded: &mut HashMap<ModelId, ModelUsage>,
     ) -> bool {
         loop {
-            let used_vram_mb: u32 = loaded
+            let used_memory_mb: u32 = loaded
                 .keys()
                 .filter_map(|name| self.resource_registry.get(name))
                 .map(|r| r.vram_mb)
                 .sum();
 
-            if used_vram_mb + needed_vram_mb <= self.total_vram_mb {
+            if used_memory_mb + needed_memory_mb <= self.total_model_memory_mb {
                 return self.load_and_track(candidate, loaded).await;
             }
 
@@ -417,5 +420,138 @@ impl Scheduler {
             },
         );
         true
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    //! Граница бюджета памяти.
+    //!
+    //! Числа здесь ПОДСТАВНЫЕ и намеренно не совпадают с реальным реестром:
+    //! `vram_mb` моделей переизмеряется, и тест, привязанный к реальным
+    //! значениям, ломался бы при каждом замере, ничего при этом не проверяя.
+    //! Проверяется правило `used + needed <= budget` и то, что резидент
+    //! занимает место безусловно, — а не конкретные мегабайты Gemma27.
+
+    use super::*;
+    use crate::model_backend::{GenerateRequest, GenerateResponse};
+    use async_trait::async_trait;
+    use std::path::PathBuf;
+
+    /// Backend, который всегда соглашается. Проверяется решение Scheduler'а
+    /// о размещении, а не поведение провайдера.
+    struct AlwaysOkBackend;
+
+    #[async_trait]
+    impl ModelBackend for AlwaysOkBackend {
+        async fn is_loaded(&self, _model: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn load(&self, _model: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn unload(&self, _model: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn generate(
+            &self,
+            _model: &str,
+            _request: GenerateRequest,
+        ) -> Result<GenerateResponse> {
+            Ok(GenerateResponse {
+                content: String::new(),
+            })
+        }
+    }
+
+    /// Резидент на 6000 и два кандидата: один влезает поверх него, другой нет.
+    fn scheduler_with_budget(budget_mb: u32) -> (Scheduler, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kaic-budget-{}-{budget_mb}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let resources = dir.join("resource_registry.yaml");
+        std::fs::write(
+            &resources,
+            "Resident:
+  vram_mb: 6000
+  load_seconds: 1
+  always_loaded: true
+
+Fits:
+  vram_mb: 18000
+  load_seconds: 1
+
+TooBig:
+  vram_mb: 26000
+  load_seconds: 1
+",
+        )
+        .unwrap();
+
+        let capabilities = dir.join("capability_registry.yaml");
+        std::fs::write(
+            &capabilities,
+            "Heavy:
+  primary: Fits
+
+Heaviest:
+  primary: TooBig
+",
+        )
+        .unwrap();
+
+        let scheduler = Scheduler::new(
+            Arc::new(CapabilityRegistry::from_file(&capabilities).unwrap()),
+            Arc::new(ResourceRegistry::from_file(&resources).unwrap()),
+            Arc::new(AlwaysOkBackend),
+            budget_mb,
+        );
+        (scheduler, dir)
+    }
+
+    /// Бюджет 24495 (реальное значение константы): 6000 резидента + 18000
+    /// кандидата = 24000 <= 24495.
+    #[tokio::test]
+    async fn model_fitting_on_top_of_the_resident_is_selected() {
+        let (scheduler, dir) = scheduler_with_budget(24495);
+        scheduler.preload_always_loaded().await.unwrap();
+
+        match scheduler.select_model("Heavy", false).await {
+            SchedulerResult::Ready(model) => assert_eq!(model, "Fits"),
+            SchedulerResult::Failed(why) => {
+                panic!("кандидат, помещающийся поверх резидента, обязан быть выбран: {why}")
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 6000 + 26000 = 32000 > 24495. Резидент вытеснению не подлежит,
+    /// поэтому освободить место не за счёт чего — это и есть вырожденный
+    /// случай Qwen40B поверх Fable9B.
+    #[tokio::test]
+    async fn model_exceeding_the_budget_with_the_resident_is_rejected() {
+        let (scheduler, dir) = scheduler_with_budget(24495);
+        scheduler.preload_always_loaded().await.unwrap();
+
+        if let SchedulerResult::Ready(model) = scheduler.select_model("Heaviest", false).await {
+            panic!("кандидат '{model}' не помещается вместе с резидентом, но был выбран");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Тот же кандидат при прежнем бюджете видеопамяти не проходил вообще —
+    /// именно это и делало пять моделей из семи недостижимыми.
+    #[tokio::test]
+    async fn the_same_model_was_unreachable_under_the_old_vram_sized_budget() {
+        let (scheduler, dir) = scheduler_with_budget(8000);
+        scheduler.preload_always_loaded().await.unwrap();
+
+        if let SchedulerResult::Ready(model) = scheduler.select_model("Heavy", false).await {
+            panic!("при бюджете размером с видеопамять '{model}' не должен был проходить");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

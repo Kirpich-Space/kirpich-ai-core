@@ -871,15 +871,19 @@ struct LoadedModelDto {
 
 #[derive(Serialize)]
 struct StatusDto {
-    total_vram_mb: u32,
-    used_vram_mb: u32,
+    /// Бюджет памяти под модели (RAM + VRAM минус резерв под ОС), а не
+    /// объём видеопамяти — см. константу в main.rs.
+    total_model_memory_mb: u32,
+    /// Сумма табличных `vram_mb` по моделям, которые Scheduler считает
+    /// загруженными. Учётная величина: у GPU ничего не спрашивается.
+    used_model_memory_mb: u32,
     loaded_models: Vec<LoadedModelDto>,
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusDto> {
     let loaded = state.scheduler.snapshot().await;
 
-    let used_vram_mb: u32 = loaded
+    let used_model_memory_mb: u32 = loaded
         .iter()
         .filter_map(|(name, _)| state.resource_registry.get(name))
         .map(|r| r.vram_mb)
@@ -891,8 +895,8 @@ async fn status(State(state): State<AppState>) -> Json<StatusDto> {
         .collect();
 
     Json(StatusDto {
-        total_vram_mb: state.scheduler.total_vram_mb(),
-        used_vram_mb,
+        total_model_memory_mb: state.scheduler.total_model_memory_mb(),
+        used_model_memory_mb,
         loaded_models,
     })
 }

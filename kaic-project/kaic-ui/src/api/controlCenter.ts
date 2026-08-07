@@ -80,8 +80,12 @@ interface LoadedModelDto {
 
 /** Общее состояние Scheduler'а — то, что возвращает GET /status. */
 export interface StatusDto {
-  total_vram_mb: number;
-  used_vram_mb: number;
+  /** Бюджет памяти под модели: RAM + VRAM минус резерв под ОС. Это НЕ объём
+   *  видеопамяти — величина сменила смысл вместе с именем. */
+  total_model_memory_mb: number;
+  /** Сумма табличных значений по загруженным моделям. Учётная величина:
+   *  backend не спрашивает у GPU, сколько занято на самом деле. */
+  used_model_memory_mb: number;
   loaded_models: LoadedModelDto[];
 }
 
