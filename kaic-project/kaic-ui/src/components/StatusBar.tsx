@@ -94,6 +94,17 @@ export default function StatusBar() {
 
       <span>Загружено: {loadedNames.length > 0 ? loadedNames.join(', ') : '—'}</span>
 
+      {/* Пока идёт загрузка, модели ещё нет в «Загружено» — она попадёт туда
+          только после завершения. Показываем операцию явно, иначе этот
+          промежуток читается как «ничего не происходит». */}
+      {status?.active_operation && (
+        <span style={{ color: '#3b82f6' }}>
+          ⟳ {status.active_operation.kind} {status.active_operation.model} (
+          {status.active_operation.reason}), {Math.round(status.active_operation.elapsed_ms / 1000)}{' '}
+          с
+        </span>
+      )}
+
       <span style={{ color: '#888' }}>
         Моделей в реестре: {models.length}
         {residentCount > 0 && ` (резидентных: ${residentCount})`}

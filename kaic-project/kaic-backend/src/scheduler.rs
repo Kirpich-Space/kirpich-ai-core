@@ -106,17 +106,50 @@ pub struct Scheduler {
     /// обоснование у константы в main.rs.
     total_model_memory_mb: u32,
 
-    /// Единственная блокировка на весь цикл `run()`: подбор модели
-    /// (включая возможную загрузку/вытеснение) и сама генерация —
+    /// ЛОК ОПЕРАЦИИ. Единственная блокировка на весь цикл `run()`: подбор
+    /// модели (включая возможную загрузку/вытеснение) и сама генерация —
     /// всё это выполняется под ней, поэтому одновременно система
     /// обслуживает только один запрос. См. модульный комментарий.
+    ///
+    /// Он же обеспечивает инвариант «не более одной загрузки/выгрузки
+    /// одновременно»: отдельный примитив для этого не заводился, потому что
+    /// этот уже даёт нужную гарантию и делает её строже необходимого.
     gpu_lock: Mutex<()>,
 
-    /// Модели, которые Scheduler считает загруженными прямо сейчас.
-    /// Это единственный источник правды о состоянии VRAM — поэтому
+    /// ЛОК СОСТОЯНИЯ. Модели, которые Scheduler считает загруженными прямо
+    /// сейчас. Это единственный источник правды о состоянии VRAM — поэтому
     /// LM Studio JIT-loading и Auto-Evict должны быть отключены
     /// (см. model_backend.rs), иначе это состояние разойдётся с реальностью.
+    ///
+    /// НИКОГДА не удерживается через `await` на сетевом вызове. Раньше
+    /// удерживался — и `GET /status` вставал на всё время загрузки модели
+    /// (измерено: 7805 мс против 12 мс в покое). Берётся только на то, чтобы
+    /// прочитать, вставить или удалить запись, и сразу отпускается.
     loaded: Mutex<HashMap<ModelId, ModelUsage>>,
+
+    /// Что Scheduler делает прямо сейчас, если делает.
+    ///
+    /// Не лок, а ячейка состояния: она существует, чтобы промежуточное
+    /// состояние было объяснимым. Без неё `/status` во время загрузки честно
+    /// сказал бы «модель не загружена» — и это было бы правдой, которую
+    /// невозможно отличить от «модели нет и не будет».
+    ///
+    /// `std::sync::Mutex`, а не `tokio` — держится микросекунды и через
+    /// `await` не проносится никогда (см. правило порядка ниже).
+    current_operation: std::sync::Mutex<Option<ActiveOperation>>,
+}
+
+/// Операция, выполняемая Scheduler'ом прямо сейчас.
+#[derive(Clone)]
+pub struct ActiveOperation {
+    /// Что делается: «загрузка» или «выгрузка». Строка, а не enum: она идёт
+    /// прямиком в лог и в `/status`, а других потребителей у неё нет.
+    pub kind: &'static str,
+    /// Модель, над которой идёт операция.
+    pub model: ModelId,
+    /// Ради чего: категория задачи или ярлык модели при прямом вызове.
+    pub reason: String,
+    pub started_at: DateTime<Utc>,
 }
 
 impl Scheduler {
@@ -137,7 +170,52 @@ impl Scheduler {
             total_model_memory_mb,
             gpu_lock: Mutex::new(()),
             loaded: Mutex::new(HashMap::new()),
+            current_operation: std::sync::Mutex::new(None),
         }
+    }
+
+    // --- ПРАВИЛО ПОРЯДКА ВЗЯТИЯ БЛОКИРОВОК ---
+    //
+    // Порядок строго такой, сверху вниз, и нарушать его нельзя:
+    //
+    //     1. gpu_lock            (лок операции, держится долго)
+    //     2. loaded              (лок состояния, держится микросекунды)
+    //     3. current_operation   (ячейка маркера, держится микросекунды)
+    //
+    // Дедлок возникает ровно при взятии в разном порядке двумя путями, и
+    // единственная защита от него — записанное и соблюдаемое правило.
+    //
+    // Дополнительно, и это важнее порядка:
+    //   * `loaded` НИКОГДА не удерживается через `await`;
+    //   * `current_operation` не берётся, пока удерживается `loaded`;
+    //   * `snapshot()` и `active_operation()` берут только свой лок (2 и 3
+    //     соответственно) и не берут `gpu_lock` — потому и отвечают
+    //     мгновенно, пока идёт долгая операция.
+
+    /// Отмечает начало операции. Вызывается ТОЛЬКО вне блокировки `loaded`.
+    fn begin_operation(&self, kind: &'static str, model: &str, reason: &str) {
+        if let Ok(mut slot) = self.current_operation.lock() {
+            *slot = Some(ActiveOperation {
+                kind,
+                model: model.to_string(),
+                reason: reason.to_string(),
+                started_at: Utc::now(),
+            });
+        }
+    }
+
+    /// Снимает отметку операции. Вызывается в том числе на путях отказа —
+    /// иначе `/status` навсегда застрял бы на несостоявшейся загрузке.
+    fn end_operation(&self) {
+        if let Ok(mut slot) = self.current_operation.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Что выполняется прямо сейчас, если выполняется.
+    /// Не берёт ни `gpu_lock`, ни `loaded` — отвечает всегда.
+    pub fn active_operation(&self) -> Option<ActiveOperation> {
+        self.current_operation.lock().ok().and_then(|s| s.clone())
     }
 
     /// Бюджет памяти под модели, известный Scheduler'у
@@ -343,13 +421,23 @@ impl Scheduler {
             ));
         }
 
-        let mut loaded = self.loaded.lock().await;
+        // Лок операции берётся и здесь, хотя на старте конкурента нет:
+        // инвариант «не более одной загрузки одновременно» должен держаться
+        // одним механизмом на всех путях, а не «на старте и так никого».
+        let _guard = self.gpu_lock.lock().await;
+
         for model in self.resource_registry.always_loaded_models() {
-            self.backend
+            self.begin_operation("загрузка", model, "always_loaded");
+            let outcome = self
+                .backend
                 .load(self.resource_registry.provider_key(model))
-                .await
+                .await;
+            self.end_operation();
+            outcome
                 .map_err(|e| anyhow!("не удалось загрузить always_loaded модель {model}: {e}"))?;
-            loaded.insert(
+
+            // Короткая блокировка состояния — уже после загрузки.
+            self.loaded.lock().await.insert(
                 model.to_string(),
                 ModelUsage {
                     last_used: Utc::now(),
@@ -416,21 +504,25 @@ impl Scheduler {
             ));
         };
 
-        {
+        // Короткая блокировка состояния, затем — размещение уже без неё.
+        let already_loaded = {
             let mut loaded = self.loaded.lock().await;
             match loaded.get_mut(model_label) {
-                Some(usage) => usage.last_used = Utc::now(),
-                None => {
-                    if !self
-                        .fit_and_load(model_label, resource.vram_mb, &mut loaded)
-                        .await
-                    {
-                        return Err(anyhow!(
-                            "не удалось разместить модель '{model_label}' в VRAM"
-                        ));
-                    }
+                Some(usage) => {
+                    usage.last_used = Utc::now();
+                    true
                 }
+                None => false,
             }
+        };
+        if !already_loaded
+            && !self
+                .fit_and_load(model_label, resource.vram_mb, model_label)
+                .await
+        {
+            return Err(anyhow!(
+                "не удалось разместить модель '{model_label}' в VRAM"
+            ));
         }
 
         let request = self.with_registry_temperature(model_label, request);
@@ -472,8 +564,6 @@ impl Scheduler {
             ));
         }
 
-        let mut loaded = self.loaded.lock().await;
-
         // Почему предыдущие кандидаты не подошли — накапливаем, чтобы
         // сказать это одной строкой, а не заставлять читать лог по кускам.
         let mut rejected: Vec<String> = Vec::new();
@@ -490,8 +580,18 @@ impl Scheduler {
                 continue;
             };
 
-            if let Some(usage) = loaded.get_mut(*candidate) {
-                usage.last_used = Utc::now();
+            // Короткая блокировка состояния: только проверить и отметить.
+            let already_loaded = {
+                let mut loaded = self.loaded.lock().await;
+                match loaded.get_mut(*candidate) {
+                    Some(usage) => {
+                        usage.last_used = Utc::now();
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if already_loaded {
                 tracing::info!(
                     "категория '{category}': выбрана '{candidate}' ({role}, уже загружена){}",
                     describe_rejected(&rejected)
@@ -500,7 +600,7 @@ impl Scheduler {
             }
 
             if self
-                .fit_and_load(candidate, resource.vram_mb, &mut loaded)
+                .fit_and_load(candidate, resource.vram_mb, category)
                 .await
             {
                 tracing::info!(
@@ -529,40 +629,55 @@ impl Scheduler {
     /// Пытается разместить модель `candidate` в бюджете памяти: сначала без
     /// вытеснения, затем вытесняя по LRU (никогда не трогая always_loaded),
     /// пока либо не найдётся места, либо вытеснять больше нечего.
-    async fn fit_and_load(
-        &self,
-        candidate: &str,
-        needed_memory_mb: u32,
-        loaded: &mut HashMap<ModelId, ModelUsage>,
-    ) -> bool {
+    ///
+    /// Лок состояния берётся здесь только на решение (посчитать занятое,
+    /// выбрать жертву) и на запись результата. Сетевые вызовы `unload`/`load`
+    /// идут БЕЗ него — ради этого функция и разбита на «решить» и «сделать».
+    /// Гонки при этом нет: конкурента не существует, `gpu_lock` пропускает
+    /// сюда только один запрос за раз.
+    async fn fit_and_load(&self, candidate: &str, needed_memory_mb: u32, reason: &str) -> bool {
         loop {
-            let used_memory_mb: u32 = loaded
-                .keys()
-                .filter_map(|name| self.resource_registry.get(name))
-                .map(|r| r.vram_mb)
-                .sum();
+            // --- решение: короткая блокировка состояния ---
+            let step = {
+                let loaded = self.loaded.lock().await;
+                let used_memory_mb: u32 = loaded
+                    .keys()
+                    .filter_map(|name| self.resource_registry.get(name))
+                    .map(|r| r.vram_mb)
+                    .sum();
 
-            if fits_in_budget(used_memory_mb, needed_memory_mb, self.total_model_memory_mb) {
-                return self.load_and_track(candidate, loaded).await;
-            }
+                if fits_in_budget(used_memory_mb, needed_memory_mb, self.total_model_memory_mb) {
+                    Step::Load
+                } else {
+                    match self.pick_eviction_victim(&loaded) {
+                        Some(victim) => Step::Evict(victim, used_memory_mb),
+                        None => Step::GiveUp(used_memory_mb),
+                    }
+                }
+            }; // лок состояния отпущен здесь — до всякого await
 
-            match self.pick_eviction_victim(loaded) {
-                Some(victim) => {
+            match step {
+                Step::Load => return self.load_and_track(candidate, reason).await,
+
+                Step::Evict(victim, used_memory_mb) => {
                     let freed = self
                         .resource_registry
                         .get(&victim)
                         .map(|r| r.vram_mb)
                         .unwrap_or(0);
-                    if self
+
+                    self.begin_operation("выгрузка", &victim, reason);
+                    let outcome = self
                         .backend
                         .unload(self.resource_registry.provider_key(&victim))
-                        .await
-                        .is_err()
-                    {
+                        .await;
+                    self.end_operation();
+
+                    if outcome.is_err() {
                         tracing::warn!("не удалось выгрузить модель '{victim}' для освобождения VRAM");
                         return false;
                     }
-                    loaded.remove(&victim);
+                    self.loaded.lock().await.remove(&victim);
                     tracing::info!(
                         "вытеснена '{victim}' ради '{candidate}': освобождено {freed} MB, \
                          требуется {needed_memory_mb} MB, было занято {used_memory_mb} MB \
@@ -570,7 +685,8 @@ impl Scheduler {
                         self.total_model_memory_mb
                     );
                 }
-                None => {
+
+                Step::GiveUp(used_memory_mb) => {
                     // Вытеснять больше нечего: остались только резиденты.
                     tracing::warn!(
                         "'{candidate}' не размещена: требуется {needed_memory_mb} MB, \
@@ -600,7 +716,12 @@ impl Scheduler {
             .map(|(name, _)| name.clone())
     }
 
-    async fn load_and_track(&self, candidate: &str, loaded: &mut HashMap<ModelId, ModelUsage>) -> bool {
+    /// Загружает модель и вносит её в учёт.
+    ///
+    /// Лок состояния берётся только на вставку — после того как загрузка
+    /// уже завершилась. На время самой загрузки состояние открыто для чтения,
+    /// а происходящее описано маркером операции.
+    async fn load_and_track(&self, candidate: &str, reason: &str) -> bool {
         let needed = self
             .resource_registry
             .get(candidate)
@@ -609,12 +730,14 @@ impl Scheduler {
         tracing::info!("загрузка '{candidate}' начата ({needed} MB по реестру)");
         let started = std::time::Instant::now();
 
-        if self
+        self.begin_operation("загрузка", candidate, reason);
+        let outcome = self
             .backend
             .load(self.resource_registry.provider_key(candidate))
-            .await
-            .is_err()
-        {
+            .await;
+        self.end_operation();
+
+        if outcome.is_err() {
             tracing::warn!(
                 "не удалось загрузить модель '{candidate}' (после {:.1} с)",
                 started.elapsed().as_secs_f64()
@@ -625,13 +748,160 @@ impl Scheduler {
             "загрузка '{candidate}' завершена за {:.1} с",
             started.elapsed().as_secs_f64()
         );
-        loaded.insert(
+        self.loaded.lock().await.insert(
             candidate.to_string(),
             ModelUsage {
                 last_used: Utc::now(),
             },
         );
         true
+    }
+}
+
+/// Следующий шаг размещения, выбранный под локом состояния и выполняемый
+/// уже без него. Существует ровно затем, чтобы решение и действие можно
+/// было разнести по разные стороны блокировки.
+enum Step {
+    /// Место есть — грузим.
+    Load,
+    /// Места нет, но есть кого вытеснить: (жертва, сколько было занято).
+    Evict(ModelId, u32),
+    /// Места нет и вытеснять нечего: (сколько было занято).
+    GiveUp(u32),
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    //! Разделение лока состояния и лока операции.
+    //!
+    //! На реальных моделях это непроверяемо: загрузка идёт минуты и зависит
+    //! от машины. Поэтому backend подставной, а его загрузка — это `sleep`
+    //! известной длительности.
+
+    use super::budget_tests::scheduler_with_sleepy_backend;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    /// Снимок состояния обязан возвращаться, пока идёт загрузка, — раньше
+    /// он вставал на всё её время (измерено: 7805 мс против 12 мс в покое).
+    #[tokio::test]
+    async fn snapshot_answers_while_a_model_is_loading() {
+        let (scheduler, dir, _) = scheduler_with_sleepy_backend(24495, 1500);
+        let scheduler = StdArc::new(scheduler);
+
+        let worker = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.select_model("Heavy", false).await })
+        };
+
+        // Дать загрузке начаться, но не завершиться.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        let snapshot = scheduler.snapshot().await;
+        let operation = scheduler.active_operation();
+        let waited = started.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_millis(300),
+            "снимок ждал {waited:?} — значит лок состояния снова держится через загрузку"
+        );
+        // Модели ещё нет в учёте — она появится только после загрузки.
+        assert!(!snapshot.iter().any(|(name, _)| name == "Fits"));
+        // ...но промежуточное состояние объяснено маркером.
+        let operation = operation.expect("во время загрузки операция обязана быть видна");
+        assert_eq!(operation.kind, "загрузка");
+        assert_eq!(operation.model, "Fits");
+        assert_eq!(operation.reason, "Heavy");
+
+        worker.await.expect("подбор завершился");
+        assert!(
+            scheduler.active_operation().is_none(),
+            "после завершения маркер обязан сниматься"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Инвариант: одновременно выполняется не более одной загрузки/выгрузки.
+    /// Обеспечивает его gpu_lock — тот самый, что был до правки; разделение
+    /// локов не должно было его ослабить.
+    #[tokio::test]
+    async fn at_most_one_load_runs_at_a_time() {
+        let (scheduler, dir, concurrent_peak) = scheduler_with_sleepy_backend(24495, 400);
+        let scheduler = StdArc::new(scheduler);
+
+        let mut running = Vec::new();
+        for _ in 0..4 {
+            let scheduler = scheduler.clone();
+            running.push(tokio::spawn(async move {
+                scheduler
+                    .run(
+                        "Heavy",
+                        false,
+                        GenerateRequest {
+                            messages: Vec::new(),
+                            temperature: None,
+                        },
+                    )
+                    .await
+                    .is_ok()
+            }));
+        }
+
+        let mut succeeded = 0;
+        for handle in running {
+            if handle.await.expect("задача не паниковала") {
+                succeeded += 1;
+            }
+        }
+
+        assert_eq!(
+            concurrent_peak.load(Ordering::SeqCst),
+            1,
+            "backend увидел одновременные загрузки — инвариант нарушен"
+        );
+        // gpu_lock берётся через try_lock: проигравшие получают отказ, а не
+        // очередь. Это прежнее поведение, и менять его задача не разрешала.
+        assert!(succeeded >= 1, "хотя бы один запрос обязан пройти");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Маркер операции обязан сниматься и тогда, когда загрузка провалилась.
+    /// Иначе `/status` навсегда показывал бы «идёт загрузка», а панель —
+    /// вечный прогресс вместо отказа.
+    #[tokio::test]
+    async fn operation_marker_is_cleared_when_a_load_fails() {
+        let (scheduler, dir) = super::budget_tests::scheduler_with_failing_backend(24495);
+
+        assert!(scheduler.active_operation().is_none(), "в покое маркера нет");
+
+        let outcome = scheduler.select_model("Heavy", false).await;
+        assert!(
+            matches!(outcome, SchedulerResult::Failed(_)),
+            "backend отказал — подбор обязан провалиться"
+        );
+        assert!(
+            scheduler.active_operation().is_none(),
+            "после отказа маркер обязан быть снят"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Счётчик одновременных загрузок для проверки инварианта.
+    pub struct ConcurrencyWatch {
+        pub now: AtomicUsize,
+        pub peak: StdArc<AtomicUsize>,
+    }
+
+    impl ConcurrencyWatch {
+        pub fn enter(&self) {
+            let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+        }
+        pub fn leave(&self) {
+            self.now.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -676,8 +946,93 @@ mod budget_tests {
         }
     }
 
+    /// Backend, чья загрузка занимает заданное время и считает, сколько
+    /// загрузок идёт одновременно. На реальных моделях проверить и то и
+    /// другое невозможно: загрузка занимает минуты и зависит от машины.
+    pub struct SleepyBackend {
+        pub load_ms: u64,
+        pub watch: super::concurrency_tests::ConcurrencyWatch,
+    }
+
+    #[async_trait]
+    impl ModelBackend for SleepyBackend {
+        async fn is_loaded(&self, _model: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn load(&self, _model: &str) -> Result<()> {
+            self.watch.enter();
+            tokio::time::sleep(std::time::Duration::from_millis(self.load_ms)).await;
+            self.watch.leave();
+            Ok(())
+        }
+        async fn unload(&self, _model: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn generate(
+            &self,
+            _model: &str,
+            _request: GenerateRequest,
+        ) -> Result<GenerateResponse> {
+            Ok(GenerateResponse {
+                content: String::new(),
+            })
+        }
+    }
+
+    /// Тот же реестр, что и у `scheduler_with_budget`, но с медленным
+    /// backend'ом. Третьим элементом — пик одновременных загрузок.
+    pub fn scheduler_with_sleepy_backend(
+        budget_mb: u32,
+        load_ms: u64,
+    ) -> (Scheduler, PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = std::sync::Arc::new(SleepyBackend {
+            load_ms,
+            watch: super::concurrency_tests::ConcurrencyWatch {
+                now: std::sync::atomic::AtomicUsize::new(0),
+                peak: peak.clone(),
+            },
+        });
+        let (scheduler, dir) = scheduler_with_backend(budget_mb, backend);
+        (scheduler, dir, peak)
+    }
+
+    /// Backend, у которого загрузка всегда падает.
+    struct FailingBackend;
+
+    #[async_trait]
+    impl ModelBackend for FailingBackend {
+        async fn is_loaded(&self, _model: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn load(&self, _model: &str) -> Result<()> {
+            Err(anyhow!("подставной отказ загрузки"))
+        }
+        async fn unload(&self, _model: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn generate(
+            &self,
+            _model: &str,
+            _request: GenerateRequest,
+        ) -> Result<GenerateResponse> {
+            Err(anyhow!("подставной отказ генерации"))
+        }
+    }
+
+    pub fn scheduler_with_failing_backend(budget_mb: u32) -> (Scheduler, PathBuf) {
+        scheduler_with_backend(budget_mb, Arc::new(FailingBackend))
+    }
+
     /// Резидент на 6000 и два кандидата: один влезает поверх него, другой нет.
     fn scheduler_with_budget(budget_mb: u32) -> (Scheduler, PathBuf) {
+        scheduler_with_backend(budget_mb, Arc::new(AlwaysOkBackend))
+    }
+
+    fn scheduler_with_backend(
+        budget_mb: u32,
+        backend: Arc<dyn ModelBackend>,
+    ) -> (Scheduler, PathBuf) {
         // Счётчик, а не бюджет, в имени каталога: тесты идут параллельно, и
         // два вызова с одинаковым бюджетом делили бы один каталог — один
         // удалял бы файлы из-под другого.
@@ -724,7 +1079,7 @@ Heaviest:
         let scheduler = Scheduler::new(
             Arc::new(CapabilityRegistry::from_file(&capabilities).unwrap()),
             Arc::new(ResourceRegistry::from_file(&resources).unwrap()),
-            Arc::new(AlwaysOkBackend),
+            backend,
             budget_mb,
         );
         (scheduler, dir)

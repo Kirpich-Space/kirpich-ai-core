@@ -87,6 +87,23 @@ export interface StatusDto {
    *  backend не спрашивает у GPU, сколько занято на самом деле. */
   used_model_memory_mb: number;
   loaded_models: LoadedModelDto[];
+  /** Что backend делает прямо сейчас, или null в покое.
+   *  Во время загрузки модели `loaded_models` её ещё не содержит — она
+   *  появится там только после завершения. Это поле объясняет промежуток:
+   *  без него панель показывала бы «не загружено» и была бы формально права,
+   *  но непонятна. */
+  active_operation: ActiveOperationDto | null;
+}
+
+/** Выполняемая прямо сейчас операция Scheduler'а (см. ActiveOperationDto). */
+export interface ActiveOperationDto {
+  /** «загрузка» или «выгрузка». */
+  kind: string;
+  model: string;
+  /** Категория задачи или ярлык модели — ради чего идёт операция. */
+  reason: string;
+  started_at: string;
+  elapsed_ms: number;
 }
 
 /** Допустимый диапазон temperature. Держится в одном месте с backend'ом

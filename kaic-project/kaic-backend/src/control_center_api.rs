@@ -898,6 +898,25 @@ struct StatusDto {
     /// загруженными. Учётная величина: у GPU ничего не спрашивается.
     used_model_memory_mb: u32,
     loaded_models: Vec<LoadedModelDto>,
+    /// Что Scheduler делает прямо сейчас, или `null` в покое.
+    ///
+    /// Без этого поля неблокирующий `/status` был бы честным, но непонятным:
+    /// во время загрузки он говорил бы «модель не загружена», и отличить это
+    /// от «модели нет и не будет» стало бы невозможно.
+    active_operation: Option<ActiveOperationDto>,
+}
+
+#[derive(Serialize)]
+struct ActiveOperationDto {
+    /// «загрузка» или «выгрузка».
+    kind: String,
+    model: String,
+    /// Категория задачи или ярлык модели — ради чего идёт операция.
+    reason: String,
+    started_at: DateTime<Utc>,
+    /// Сколько уже длится. Считается на сервере, чтобы клиенту не пришлось
+    /// сверять часы.
+    elapsed_ms: i64,
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusDto> {
@@ -914,10 +933,19 @@ async fn status(State(state): State<AppState>) -> Json<StatusDto> {
         .map(|(model, last_used)| LoadedModelDto { model, last_used })
         .collect();
 
+    let active_operation = state.scheduler.active_operation().map(|op| ActiveOperationDto {
+        kind: op.kind.to_string(),
+        model: op.model,
+        reason: op.reason,
+        started_at: op.started_at,
+        elapsed_ms: (Utc::now() - op.started_at).num_milliseconds(),
+    });
+
     Json(StatusDto {
         total_model_memory_mb: state.scheduler.total_model_memory_mb(),
         used_model_memory_mb,
         loaded_models,
+        active_operation,
     })
 }
 
