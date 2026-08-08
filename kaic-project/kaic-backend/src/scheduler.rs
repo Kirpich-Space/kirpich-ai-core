@@ -47,6 +47,16 @@ fn fits_in_budget(used_mb: u32, needed_mb: u32, budget_mb: u32) -> bool {
     used_mb + needed_mb <= budget_mb
 }
 
+/// Хвост строки выбора модели: почему не подошли предыдущие кандидаты.
+/// Пусто, если подошёл первый же — тогда объяснять нечего.
+fn describe_rejected(rejected: &[String]) -> String {
+    if rejected.is_empty() {
+        String::new()
+    } else {
+        format!("; пропущены — {}", rejected.join("; "))
+    }
+}
+
 /// Что система реально может при текущем бюджете и реестре.
 ///
 /// Считается один раз при старте. Все выводы получены через
@@ -464,17 +474,28 @@ impl Scheduler {
 
         let mut loaded = self.loaded.lock().await;
 
-        for candidate in candidates {
+        // Почему предыдущие кандидаты не подошли — накапливаем, чтобы
+        // сказать это одной строкой, а не заставлять читать лог по кускам.
+        let mut rejected: Vec<String> = Vec::new();
+
+        for (position, candidate) in candidates.iter().enumerate() {
+            let role = if position == 0 { "primary" } else { "fallback" };
+
             let Some(resource) = self.resource_registry.get(candidate) else {
                 tracing::warn!(
                     "модель '{candidate}' есть в Capability Registry, но отсутствует \
                      в Resource Registry — пропускаю"
                 );
+                rejected.push(format!("{candidate}: нет в Resource Registry"));
                 continue;
             };
 
-            if let Some(usage) = loaded.get_mut(candidate) {
+            if let Some(usage) = loaded.get_mut(*candidate) {
                 usage.last_used = Utc::now();
+                tracing::info!(
+                    "категория '{category}': выбрана '{candidate}' ({role}, уже загружена){}",
+                    describe_rejected(&rejected)
+                );
                 return SchedulerResult::Ready(candidate.to_string());
             }
 
@@ -482,11 +503,22 @@ impl Scheduler {
                 .fit_and_load(candidate, resource.vram_mb, &mut loaded)
                 .await
             {
+                tracing::info!(
+                    "категория '{category}': выбрана '{candidate}' ({role}, загружена сейчас){}",
+                    describe_rejected(&rejected)
+                );
                 return SchedulerResult::Ready(candidate.to_string());
             }
             // Кандидат не поместился даже после вытеснения — пробуем следующий
             // по fallback-цепочке, не прерываем весь подбор.
+            rejected.push(format!("{candidate}: не помещается ({} MB)", resource.vram_mb));
         }
+
+        tracing::warn!(
+            "категория '{category}': кандидат не подобран, перебрано {} — {}",
+            candidates.len(),
+            rejected.join("; ")
+        );
 
         SchedulerResult::Failed(format!(
             "не удалось подобрать модель для категории '{category}': \
@@ -516,6 +548,11 @@ impl Scheduler {
 
             match self.pick_eviction_victim(loaded) {
                 Some(victim) => {
+                    let freed = self
+                        .resource_registry
+                        .get(&victim)
+                        .map(|r| r.vram_mb)
+                        .unwrap_or(0);
                     if self
                         .backend
                         .unload(self.resource_registry.provider_key(&victim))
@@ -526,8 +563,23 @@ impl Scheduler {
                         return false;
                     }
                     loaded.remove(&victim);
+                    tracing::info!(
+                        "вытеснена '{victim}' ради '{candidate}': освобождено {freed} MB, \
+                         требуется {needed_memory_mb} MB, было занято {used_memory_mb} MB \
+                         из {} MB бюджета",
+                        self.total_model_memory_mb
+                    );
                 }
-                None => return false, // вытеснять больше нечего, кандидат не помещается
+                None => {
+                    // Вытеснять больше нечего: остались только резиденты.
+                    tracing::warn!(
+                        "'{candidate}' не размещена: требуется {needed_memory_mb} MB, \
+                         занято {used_memory_mb} MB из {} MB бюджета, вытеснять нечего \
+                         (осталось только always_loaded)",
+                        self.total_model_memory_mb
+                    );
+                    return false;
+                }
             }
         }
     }
@@ -549,15 +601,30 @@ impl Scheduler {
     }
 
     async fn load_and_track(&self, candidate: &str, loaded: &mut HashMap<ModelId, ModelUsage>) -> bool {
+        let needed = self
+            .resource_registry
+            .get(candidate)
+            .map(|r| r.vram_mb)
+            .unwrap_or(0);
+        tracing::info!("загрузка '{candidate}' начата ({needed} MB по реестру)");
+        let started = std::time::Instant::now();
+
         if self
             .backend
             .load(self.resource_registry.provider_key(candidate))
             .await
             .is_err()
         {
-            tracing::warn!("не удалось загрузить модель '{candidate}'");
+            tracing::warn!(
+                "не удалось загрузить модель '{candidate}' (после {:.1} с)",
+                started.elapsed().as_secs_f64()
+            );
             return false;
         }
+        tracing::info!(
+            "загрузка '{candidate}' завершена за {:.1} с",
+            started.elapsed().as_secs_f64()
+        );
         loaded.insert(
             candidate.to_string(),
             ModelUsage {

@@ -157,6 +157,15 @@ async fn create_task(
         .await?
         .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("задача исчезла сразу после создания")))?;
 
+    // Текст задачи в лог НЕ идёт: он приходит в том числе из Telegram и
+    // может содержать личные данные. В логе только идентификатор и категория.
+    tracing::info!(
+        "задача {} создана: категория '{}'{}",
+        task.id,
+        category,
+        if body.category.is_some() { "" } else { " (определена Router'ом)" }
+    );
+
     // Задача уже сохранена в статусе Running — Electron получает её сразу
     // и дальше следит за изменениями через GET /tasks/{id}. Сама работа
     // (подбор модели + генерация) идёт в фоне, а не блокирует этот запрос:
@@ -641,8 +650,16 @@ async fn run_task_pipeline(
     // в итоге возьмёт задачу.
     let request = GenerateRequest { messages, temperature: None };
 
+    let started = std::time::Instant::now();
     match scheduler.run(&category, allow_manual, request).await {
         Ok(response) => {
+            // Длина ответа, а не ответ: размер полезен для диагностики,
+            // содержимое в лог не идёт.
+            tracing::info!(
+                "задача {task_id} завершена: done за {:.1} с, ответ {} символов",
+                started.elapsed().as_secs_f64(),
+                response.content.chars().count()
+            );
             let append_result = task_store
                 .append_context(
                     task_id,
@@ -661,7 +678,10 @@ async fn run_task_pipeline(
             }
         }
         Err(err) => {
-            tracing::warn!("задача {task_id} завершилась ошибкой: {err:#}");
+            tracing::warn!(
+                "задача {task_id} завершена: failed за {:.1} с — {err:#}",
+                started.elapsed().as_secs_f64()
+            );
             let append_result = task_store
                 .append_context(
                     task_id,
