@@ -22,7 +22,12 @@ src = bpy.data.objects.get("Cube")
 if src is None:
     print("FAIL: в исходном файле нет объекта Cube — задание невыполнимо, проверка недействительна")
     sys.exit(2)
-src_z = src.location.z
+# Снимаем координаты СРАЗУ в обычные числа: после открытия второго файла
+# ссылка на объект из первого становится недействительной
+# (ReferenceError: StructRNA of type Object has been removed).
+# Это правка дефекта проверки, а не смягчение критерия: требование прежнее —
+# ровно +3 по Z и без смещения по X/Y.
+src_x, src_y, src_z = float(src.location.x), float(src.location.y), float(src.location.z)
 
 # Новый: где Cube стал.
 bpy.ops.wm.open_mainfile(filepath=dst_path)
@@ -33,7 +38,7 @@ else:
     moved = dst.location.z - src_z
     if abs(moved - 3.0) > 1e-3:
         fails.append(f"Cube сместился по Z на {moved:.3f}, а требовалось ровно 3")
-    if abs(dst.location.x - src.location.x) > 1e-3 or abs(dst.location.y - src.location.y) > 1e-3:
+    if abs(dst.location.x - src_x) > 1e-3 or abs(dst.location.y - src_y) > 1e-3:
         fails.append("сместился не только по Z")
 
 print("FAIL: " + "; ".join(fails) if fails else "PASS")
