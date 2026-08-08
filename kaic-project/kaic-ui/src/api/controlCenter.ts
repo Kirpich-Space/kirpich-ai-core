@@ -87,12 +87,25 @@ export interface StatusDto {
    *  backend не спрашивает у GPU, сколько занято на самом деле. */
   used_model_memory_mb: number;
   loaded_models: LoadedModelDto[];
+  /** Сколько генераций идёт прямо сейчас. Нужно, чтобы «система свободна»
+   *  и «идут две задачи, третья будет отвергнута» не выглядели одинаково. */
+  running_tasks: number;
+  /** Предел, после которого задачи получают отказ (а не встают в очередь). */
+  max_concurrent_tasks: number;
+  busy_models: BusyModelDto[];
   /** Что backend делает прямо сейчас, или null в покое.
    *  Во время загрузки модели `loaded_models` её ещё не содержит — она
    *  появится там только после завершения. Это поле объясняет промежуток:
    *  без него панель показывала бы «не загружено» и была бы формально права,
    *  но непонятна. */
   active_operation: ActiveOperationDto | null;
+}
+
+/** Модель, на которой прямо сейчас идёт генерация. Такие модели не
+ *  вытесняются: выгрузить их значило бы оборвать работающий запрос. */
+export interface BusyModelDto {
+  model: string;
+  generations: number;
 }
 
 /** Выполняемая прямо сейчас операция Scheduler'а (см. ActiveOperationDto). */

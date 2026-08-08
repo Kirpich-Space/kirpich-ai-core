@@ -898,12 +898,28 @@ struct StatusDto {
     /// загруженными. Учётная величина: у GPU ничего не спрашивается.
     used_model_memory_mb: u32,
     loaded_models: Vec<LoadedModelDto>,
+    /// Сколько генераций идёт прямо сейчас и на каких моделях.
+    ///
+    /// Без этого «система свободна» и «идут две задачи, третья будет
+    /// отвергнута» выглядят в панели одинаково.
+    running_tasks: usize,
+    /// Предел, после которого задачи получают отказ.
+    max_concurrent_tasks: usize,
+    busy_models: Vec<BusyModelDto>,
     /// Что Scheduler делает прямо сейчас, или `null` в покое.
     ///
     /// Без этого поля неблокирующий `/status` был бы честным, но непонятным:
     /// во время загрузки он говорил бы «модель не загружена», и отличить это
     /// от «модели нет и не будет» стало бы невозможно.
     active_operation: Option<ActiveOperationDto>,
+}
+
+#[derive(Serialize)]
+struct BusyModelDto {
+    model: String,
+    /// Сколько генераций идёт на этой модели. Больше одной возможно:
+    /// предел считается по задачам, а не по моделям.
+    generations: usize,
 }
 
 #[derive(Serialize)]
@@ -941,10 +957,20 @@ async fn status(State(state): State<AppState>) -> Json<StatusDto> {
         elapsed_ms: (Utc::now() - op.started_at).num_milliseconds(),
     });
 
+    let busy_models: Vec<BusyModelDto> = state
+        .scheduler
+        .busy_models()
+        .into_iter()
+        .map(|(model, generations)| BusyModelDto { model, generations })
+        .collect();
+
     Json(StatusDto {
         total_model_memory_mb: state.scheduler.total_model_memory_mb(),
         used_model_memory_mb,
         loaded_models,
+        running_tasks: state.scheduler.running_generations(),
+        max_concurrent_tasks: crate::scheduler::MAX_CONCURRENT_TASKS,
+        busy_models,
         active_operation,
     })
 }

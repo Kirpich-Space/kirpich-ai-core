@@ -94,6 +94,17 @@ export default function StatusBar() {
 
       <span>Загружено: {loadedNames.length > 0 ? loadedNames.join(', ') : '—'}</span>
 
+      {/* Число задач и занятые модели: без них «свободно» и «идут две, третья
+          получит отказ» выглядят одинаково. Занятые модели помечены, потому
+          что именно они не подлежат вытеснению. */}
+      <span style={{ color: (status?.running_tasks ?? 0) > 0 ? '#3b82f6' : '#888' }}>
+        Задач: {status?.running_tasks ?? 0} / {status?.max_concurrent_tasks ?? 0}
+        {status?.busy_models && status.busy_models.length > 0 &&
+          ` (занято: ${status.busy_models
+            .map((b) => (b.generations > 1 ? `${b.model}×${b.generations}` : b.model))
+            .join(', ')})`}
+      </span>
+
       {/* Пока идёт загрузка, модели ещё нет в «Загружено» — она попадёт туда
           только после завершения. Показываем операцию явно, иначе этот
           промежуток читается как «ничего не происходит». */}
