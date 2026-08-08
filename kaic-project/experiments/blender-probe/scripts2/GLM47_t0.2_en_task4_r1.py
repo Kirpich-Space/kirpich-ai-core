@@ -1,0 +1,13 @@
+import bpy
+
+# Open the existing file
+input_path = r"C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GLM47_t0.2_en_r1/task1.blend"
+bpy.ops.wm.open_mainfile(filepath=input_path)
+
+# Find the object named Cube and move it 3 units up (Y-axis is 'Up' in Blender)
+if "Cube" in bpy.data.objects:
+    bpy.data.objects["Cube"].location.y += 3
+
+# Save the result as a new file without changing the original
+output_path = r"C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GLM47_t0.2_en_r1/task4.blend"
+bpy.ops.wm.save_as_mainfile(filepath=output_path, copy=True)

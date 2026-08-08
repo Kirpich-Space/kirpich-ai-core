@@ -1,0 +1,6 @@
+{"cell": "GPTOSS20_t0.2_ru_task1_r1", "gen_s": 21.0, "chars": 399, "fenced": false, "refusals": [], "empty": false}
+{"cell": "GPTOSS20_t0.2_ru_task1_r2", "gen_s": 21.1, "chars": 411, "fenced": false, "refusals": [], "empty": false}
+{"cell": "GPTOSS20_t0.2_ru_task2_r1", "gen_s": 37.2, "chars": 740, "fenced": false, "refusals": [], "empty": false}
+{"cell": "GPTOSS20_t0.2_ru_task2_r2", "gen_s": 40.7, "chars": 798, "fenced": false, "refusals": [], "empty": false}
+{"cell": "GPTOSS20_t0.2_ru_task4_r1", "gen_s": 34.8, "chars": 519, "fenced": false, "refusals": [], "empty": false}
+{"cell": "GPTOSS20_t0.2_ru_task4_r2", "gen_s": 29.3, "chars": 524, "fenced": false, "refusals": [], "empty": false}

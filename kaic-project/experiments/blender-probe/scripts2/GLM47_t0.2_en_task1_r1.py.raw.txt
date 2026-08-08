@@ -1,0 +1,14 @@
+```python
+import bpy
+
+# Remove default objects from the scene
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete()
+
+# Create a cube at the world origin
+bpy.ops.mesh.primitive_cube_add(size=1)
+
+# Save the scene to the specified path
+filepath = r"C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GLM47_t0.2_en_r1/task1.blend"
+bpy.ops.wm.save_as_mainfile(filepath=filepath)
+```

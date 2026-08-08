@@ -1,0 +1,146 @@
+[
+  {
+    "cell": "GPTOSS20_t0.0_en_task1_r1",
+    "gen_s": 26.7,
+    "chars": 445,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.0_en_task1_r2",
+    "gen_s": 26.4,
+    "chars": 460,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.0_en_task1_r3",
+    "gen_s": 25.4,
+    "chars": 460,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.0_en_task2_r1",
+    "gen_s": 43.2,
+    "chars": 821,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.0_en_task2_r2",
+    "gen_s": 38.0,
+    "chars": 747,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.0_en_task2_r3",
+    "gen_s": 39.3,
+    "chars": 755,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.2_en_task1_r1",
+    "gen_s": 25.1,
+    "chars": 460,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.2_en_task1_r2",
+    "gen_s": 24.8,
+    "chars": 433,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.2_en_task1_r3",
+    "gen_s": 22.6,
+    "chars": 430,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.2_en_task2_r1",
+    "gen_s": 39.2,
+    "chars": 755,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.2_en_task2_r2",
+    "gen_s": 61.6,
+    "chars": 1115,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.2_en_task2_r3",
+    "gen_s": 41.5,
+    "chars": 802,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.7_en_task1_r1",
+    "gen_s": 35.3,
+    "chars": 689,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.7_en_task1_r2",
+    "gen_s": 29.4,
+    "chars": 404,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.7_en_task1_r3",
+    "gen_s": 28.7,
+    "chars": 517,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.7_en_task2_r1",
+    "gen_s": 47.3,
+    "chars": 742,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.7_en_task2_r2",
+    "gen_s": 52.2,
+    "chars": 964,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GPTOSS20_t0.7_en_task2_r3",
+    "gen_s": 44.5,
+    "chars": 836,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  }
+]

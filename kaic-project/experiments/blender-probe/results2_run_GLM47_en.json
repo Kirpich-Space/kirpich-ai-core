@@ -1,0 +1,20 @@
+[
+  {
+    "cell": "GLM47_t0.2_en_task1_r1",
+    "run_s": 5.1,
+    "blender_error": "",
+    "outcome": "PASS"
+  },
+  {
+    "cell": "GLM47_t0.2_en_task2_r1",
+    "run_s": 2.1,
+    "blender_error": "",
+    "outcome": "PASS"
+  },
+  {
+    "cell": "GLM47_t0.2_en_task4_r1",
+    "run_s": 0.7,
+    "blender_error": "",
+    "outcome": "FAIL: Cube сместился по Z на 0.000, а требовалось ровно 3; сместился не только по Z"
+  }
+]

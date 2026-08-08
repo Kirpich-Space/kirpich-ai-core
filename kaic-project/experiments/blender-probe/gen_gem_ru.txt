@@ -1,0 +1,6 @@
+{"cell": "Gemma27_t0.2_ru_task1_r1", "gen_s": 252.3, "chars": 599, "fenced": false, "refusals": [], "empty": false}
+{"cell": "Gemma27_t0.2_ru_task1_r2", "gen_s": 267.8, "chars": 618, "fenced": false, "refusals": [], "empty": false}
+{"cell": "Gemma27_t0.2_ru_task2_r1", "gen_s": 444.3, "chars": 1460, "fenced": false, "refusals": [], "empty": false}
+{"cell": "Gemma27_t0.2_ru_task2_r2", "gen_s": 508.6, "chars": 1209, "fenced": false, "refusals": [], "empty": false}
+{"cell": "Gemma27_t0.2_ru_task4_r1", "gen_s": 170.2, "chars": 407, "fenced": false, "refusals": [], "empty": false}
+{"cell": "Gemma27_t0.2_ru_task4_r2", "gen_s": 162.3, "chars": 407, "fenced": false, "refusals": [], "empty": false}

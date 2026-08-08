@@ -1,0 +1,18 @@
+{"cell": "GPTOSS20_t0.0_en_task1_r1", "run_s": 1.2, "blender_error": "", "outcome": "PASS"}
+{"cell": "GPTOSS20_t0.0_en_task1_r2", "run_s": 0.7, "blender_error": "", "outcome": "PASS"}
+{"cell": "GPTOSS20_t0.0_en_task1_r3", "run_s": 0.8, "blender_error": "", "outcome": "PASS"}
+{"cell": "GPTOSS20_t0.0_en_task2_r1", "run_s": 0.8, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.0_en_r1/task2.png"}
+{"cell": "GPTOSS20_t0.0_en_task2_r2", "run_s": 0.7, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.0_en_r2/task2.png"}
+{"cell": "GPTOSS20_t0.0_en_task2_r3", "run_s": 0.8, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.0_en_r3/task2.png"}
+{"cell": "GPTOSS20_t0.2_en_task1_r1", "run_s": 0.8, "blender_error": "", "outcome": "PASS"}
+{"cell": "GPTOSS20_t0.2_en_task1_r2", "run_s": 0.8, "blender_error": "", "outcome": "PASS"}
+{"cell": "GPTOSS20_t0.2_en_task1_r3", "run_s": 0.7, "blender_error": "", "outcome": "PASS"}
+{"cell": "GPTOSS20_t0.2_en_task2_r1", "run_s": 0.7, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.2_en_r1/task2.png"}
+{"cell": "GPTOSS20_t0.2_en_task2_r2", "run_s": 0.7, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.2_en_r2/task2.png"}
+{"cell": "GPTOSS20_t0.2_en_task2_r3", "run_s": 0.7, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.2_en_r3/task2.png"}
+{"cell": "GPTOSS20_t0.7_en_task1_r1", "run_s": 0.7, "blender_error": "NameError: name 'bmesh' is not defined. Did you mean: 'mesh'?", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.7_en_r1/task1.blend"}
+{"cell": "GPTOSS20_t0.7_en_task1_r2", "run_s": 0.8, "blender_error": "", "outcome": "PASS"}
+{"cell": "GPTOSS20_t0.7_en_task1_r3", "run_s": 0.8, "blender_error": "", "outcome": "PASS"}
+{"cell": "GPTOSS20_t0.7_en_task2_r1", "run_s": 0.8, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.7_en_r1/task2.png"}
+{"cell": "GPTOSS20_t0.7_en_task2_r2", "run_s": 0.8, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.7_en_r2/task2.png"}
+{"cell": "GPTOSS20_t0.7_en_task2_r3", "run_s": 0.7, "blender_error": "RuntimeError: Error: Cannot render, no camera", "outcome": "FAIL: פאיכא םוע: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/GPTOSS20_t0.7_en_r3/task2.png"}

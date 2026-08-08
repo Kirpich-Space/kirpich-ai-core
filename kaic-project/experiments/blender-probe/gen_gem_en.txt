@@ -1,0 +1,2 @@
+{"cell": "Gemma27_t0.2_en_task1_r1", "gen_s": 193.5, "chars": 638, "fenced": false, "refusals": [], "empty": false}
+{"cell": "Gemma27_t0.2_en_task4_r1", "gen_s": 165.9, "chars": 407, "fenced": false, "refusals": [], "empty": false}

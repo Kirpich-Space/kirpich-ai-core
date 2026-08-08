@@ -1,0 +1,26 @@
+[
+  {
+    "cell": "GLM47_t0.2_en_task1_r1",
+    "gen_s": 151.1,
+    "chars": 382,
+    "fenced": true,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GLM47_t0.2_en_task2_r1",
+    "gen_s": 211.1,
+    "chars": 976,
+    "fenced": true,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "GLM47_t0.2_en_task4_r1",
+    "gen_s": 272.9,
+    "chars": 567,
+    "fenced": true,
+    "refusals": [],
+    "empty": false
+  }
+]

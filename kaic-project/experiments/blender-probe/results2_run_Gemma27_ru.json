@@ -1,0 +1,38 @@
+[
+  {
+    "cell": "Gemma27_t0.2_ru_task1_r1",
+    "run_s": 1.1,
+    "blender_error": "",
+    "outcome": "PASS"
+  },
+  {
+    "cell": "Gemma27_t0.2_ru_task1_r2",
+    "run_s": 0.7,
+    "blender_error": "",
+    "outcome": "PASS"
+  },
+  {
+    "cell": "Gemma27_t0.2_ru_task2_r1",
+    "run_s": 2.0,
+    "blender_error": "",
+    "outcome": "PASS"
+  },
+  {
+    "cell": "Gemma27_t0.2_ru_task2_r2",
+    "run_s": 1.7,
+    "blender_error": "",
+    "outcome": "PASS"
+  },
+  {
+    "cell": "Gemma27_t0.2_ru_task4_r1",
+    "run_s": 0.7,
+    "blender_error": "AttributeError: Calling operator \"bpy.ops.blendfile.open\" error, could not be found",
+    "outcome": "FAIL: нового файла нет: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/Gemma27_t0.2_ru_r1/task4.blend"
+  },
+  {
+    "cell": "Gemma27_t0.2_ru_task4_r2",
+    "run_s": 0.7,
+    "blender_error": "AttributeError: Calling operator \"bpy.ops.blendfile.open\" error, could not be found",
+    "outcome": "FAIL: нового файла нет: C:/Users/KIRPIC~1/AppData/Local/Temp/blender-probe/out2/Gemma27_t0.2_ru_r2/task4.blend"
+  }
+]

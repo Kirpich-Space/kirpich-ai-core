@@ -1,0 +1,148 @@
+[
+  {
+    "cell": "Fable9B_t0.0_en_task1_r1",
+    "gen_s": 32.4,
+    "chars": 390,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.0_en_task1_r2",
+    "gen_s": 26.6,
+    "chars": 297,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.0_en_task1_r3",
+    "gen_s": 25.2,
+    "chars": 369,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.0_en_task2_r1",
+    "gen_s": 27.7,
+    "chars": 710,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.0_en_task2_r2",
+    "gen_s": 40.0,
+    "chars": 709,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.0_en_task2_r3",
+    "gen_s": 74.0,
+    "chars": 709,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.2_en_task1_r1",
+    "gen_s": 26.6,
+    "chars": 399,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.2_en_task1_r2",
+    "gen_s": 22.3,
+    "chars": 222,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.2_en_task1_r3",
+    "gen_s": 44.7,
+    "chars": 494,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.2_en_task2_r1",
+    "gen_s": 30.4,
+    "chars": 1442,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.2_en_task2_r2",
+    "gen_s": 51.2,
+    "chars": 1288,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.2_en_task2_r3",
+    "gen_s": 98.1,
+    "chars": 704,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.7_en_task1_r1",
+    "gen_s": 34.6,
+    "chars": 336,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.7_en_task1_r2",
+    "gen_s": 25.6,
+    "chars": 384,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.7_en_task1_r3",
+    "gen_s": 55.0,
+    "chars": 639,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.7_en_task2_r1",
+    "gen_s": 172.9,
+    "chars": 1739,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.7_en_task2_r2",
+    "gen_s": 34.6,
+    "chars": 1951,
+    "fenced": false,
+    "refusals": [
+      "путь вне песочницы: C:\\Users\\KIRPIC~1\\AppData\\Local\\Temp"
+    ],
+    "empty": false
+  },
+  {
+    "cell": "Fable9B_t0.7_en_task2_r3",
+    "gen_s": 49.4,
+    "chars": 1225,
+    "fenced": false,
+    "refusals": [],
+    "empty": false
+  }
+]
