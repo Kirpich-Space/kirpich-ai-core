@@ -39,6 +39,52 @@ const MAX_TERM_CHARS: usize = 60;
 /// длинная фраза сужает выдачу до нуля — ровно тот дефект, что мы чиним.
 const MAX_TERM_WORDS: usize = 3;
 
+/// Служебные слова, которые не должны оставаться ПОСЛЕДНИМИ в термине.
+///
+/// Обрезка до трёх слов рубит фразу посередине, и хвостом оказывается
+/// предлог: «снежный лес на», «старый маяк на», «Old lighthouse on»,
+/// «улица под». Openverse требует совпадения ВСЕХ слов, поэтому висящий
+/// предлог не уточняет запрос, а обваливает выдачу — замер 2026-08-09:
+/// «старый маяк на» дало 4 результата против 240 у «Old lighthouse on».
+///
+/// Оба языка намеренно. Язык вывода мы пиним промптом, но модель может
+/// сорваться на русский, и санитайзер обязан пережить это сам.
+///
+/// Список только для ХВОСТА. Внутри фразы те же слова осмысленны:
+/// «bridge over river» — нормальный термин, и `over` там трогать нельзя.
+const TRAILING_STOPWORDS: &[&str] = &[
+    // английский
+    "a", "an", "the", "of", "on", "in", "at", "to", "for", "with", "by",
+    "from", "over", "under", "into", "near", "and", "or",
+    // русский
+    "в", "во", "на", "над", "под", "у", "к", "ко", "с", "со", "из", "от",
+    "до", "по", "за", "при", "про", "для", "и", "или", "около", "возле",
+];
+
+/// Снимает служебные слова с конца термина.
+///
+/// Возвращает исходную строку, если после снятия ничего не осталось: пустой
+/// термин хуже неточного — он отправил бы контур на дословный текст задачи,
+/// то есть ровно к тому дефекту, ради которого извлечение и делалось.
+fn strip_trailing_stopwords(term: &str) -> String {
+    let mut words: Vec<&str> = term.split_whitespace().collect();
+    while words.len() > 1 {
+        let last = words[words.len() - 1].to_lowercase();
+        if TRAILING_STOPWORDS.contains(&last.as_str()) {
+            words.pop();
+        } else {
+            break;
+        }
+    }
+    // `len() > 1` в условии уже гарантирует непустоту, но если термин
+    // состоял ровно из одного служебного слова — возвращаем его как есть.
+    if words.is_empty() {
+        term.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
 /// Промпт намеренно минимальный: без грамматик и структурного форсинга.
 /// Задача простая, а вся структура, которая нам нужна — одна строка.
 pub fn build_messages(task_text: &str) -> Vec<Message> {
@@ -105,6 +151,9 @@ pub fn sanitize(raw: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
 
+    // Снимаем хвост ПОСЛЕ обрезки: именно обрезка его и создаёт.
+    let term = strip_trailing_stopwords(&term);
+
     if term.trim().is_empty() {
         None
     } else {
@@ -153,6 +202,55 @@ mod tests {
     fn single_word_has_nothing_to_narrow() {
         assert_eq!(narrowing_variants("озеро"), vec!["озеро"]);
         assert!(narrowing_variants("").is_empty());
+    }
+
+    // --- Хвостовые служебные слова ---
+    // Все четыре случая ниже взяты из замера 2026-08-09, а не придуманы:
+    // именно они уронили выдачу с 240 до 4 и до 1.
+
+    #[test]
+    fn trailing_preposition_is_stripped_in_both_languages() {
+        assert_eq!(strip_trailing_stopwords("снежный лес на"), "снежный лес");
+        assert_eq!(strip_trailing_stopwords("старый маяк на"), "старый маяк");
+        assert_eq!(strip_trailing_stopwords("Old lighthouse on"), "Old lighthouse");
+        assert_eq!(strip_trailing_stopwords("улица под"), "улица");
+    }
+
+    #[test]
+    fn meaningful_last_word_is_kept() {
+        assert_eq!(strip_trailing_stopwords("mountain lake"), "mountain lake");
+        assert_eq!(strip_trailing_stopwords("горное озеро"), "горное озеро");
+        assert_eq!(strip_trailing_stopwords("busy city street"), "busy city street");
+    }
+
+    #[test]
+    fn stopword_inside_the_phrase_is_untouched() {
+        // «over» в середине — часть смысла, а не мусор обрезки.
+        assert_eq!(strip_trailing_stopwords("bridge over river"), "bridge over river");
+        assert_eq!(strip_trailing_stopwords("дом у моря"), "дом у моря");
+    }
+
+    #[test]
+    fn stripping_never_yields_an_empty_term() {
+        // Термин целиком из служебных слов: снимать до пустоты нельзя —
+        // пустой термин отправил бы контур на дословный текст задачи.
+        assert_eq!(strip_trailing_stopwords("на"), "на");
+        assert_eq!(strip_trailing_stopwords("of the"), "of");
+        assert!(!strip_trailing_stopwords("под над").is_empty());
+    }
+
+    #[test]
+    fn sanitize_applies_stripping_after_the_three_word_limit() {
+        // Предел в 3 слова соблюдён, и хвост, созданный самой обрезкой, снят.
+        assert_eq!(
+            sanitize("старый маяк на скалистом берегу"),
+            Some("старый маяк".to_string())
+        );
+        // Три осмысленных слова остаются тремя.
+        assert_eq!(
+            sanitize("busy city street in the rain"),
+            Some("busy city street".to_string())
+        );
     }
 
     #[test]
