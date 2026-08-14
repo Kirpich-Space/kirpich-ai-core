@@ -314,19 +314,55 @@ impl ResourceRegistry {
 /// только внутри одной файловой системы) и переименовываем поверх цели.
 /// `rename` заменяет существующий файл одной операцией: читатель видит
 /// либо целиком старое содержимое, либо целиком новое, и никогда — обрубок.
-fn write_atomically(path: &Path, contents: &str) -> Result<()> {
+/// Имя временного файла для одной записи.
+///
+/// Два свойства, и оба обязательны.
+///
+/// **Тот же каталог, что у цели.** Это не удобство — `fs::rename` атомарен
+/// только внутри одной файловой системы. Временный файл в `%TEMP%` превратил
+/// бы атомарную подмену в копирование, то есть ровно в тот обрыв на середине,
+/// от которого вся эта функция и защищает.
+///
+/// **Уникальность на процесс и на вызов.** Имя было фиксированным
+/// (`.resource_registry.yaml.tmp`), и два одновременных писателя писали в
+/// ОДИН путь: `fs::write` усекает и пишет, второй писатель мог наложиться на
+/// первого, а `rename` опубликовал бы смесь. На 200 парах это не выстрелило —
+/// но отсутствие наблюдения не есть доказательство безопасности, а цена
+/// доказательства здесь равна двум строкам.
+fn temp_path_for(path: &Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALL: AtomicU64 = AtomicU64::new(0);
+
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "registry.yaml".to_string());
-    let tmp = dir.join(format!(".{file_name}.tmp"));
+    // Процесс различает писателей между процессами, счётчик — внутри одного.
+    let call = CALL.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(".{file_name}.{}.{call}.tmp", std::process::id()))
+}
 
-    std::fs::write(&tmp, contents)
-        .with_context(|| format!("не удалось записать временный файл {}", tmp.display()))?;
+fn write_atomically(path: &Path, contents: &str) -> Result<()> {
+    let tmp = temp_path_for(path);
+
+    if let Err(err) = std::fs::write(&tmp, contents) {
+        // Оборванная запись оставляет не «валидное новое состояние», а
+        // обрубок. Хранить его незачем, а с уникальным именем его никто уже
+        // не перезапишет — значит убирать здесь, иначе мусор копится.
+        std::fs::remove_file(&tmp).ok();
+        return Err(err)
+            .with_context(|| format!("не удалось записать временный файл {}", tmp.display()));
+    }
+
     std::fs::rename(&tmp, path).with_context(|| {
-        // Временный файл оставляем на месте: он содержит валидное новое
-        // состояние, и молча удалить его — потерять единственную копию.
+        // А ВОТ ЗДЕСЬ временный файл оставляем намеренно: запись удалась,
+        // и он содержит валидное новое состояние — единственную его копию.
+        // Молча удалить значит потерять правку.
+        //
+        // Цена уникального имени: такие остатки больше не затираются
+        // следующей записью, а накапливаются. Осознанный размен —
+        // накопленный мусор виден, потерянная правка нет.
         format!(
             "не удалось переименовать {} в {}",
             tmp.display(),
@@ -512,6 +548,42 @@ Fable9B:
         assert!(leftovers.is_empty(), "остался временный файл: {leftovers:?}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_temp_file_is_unique_per_call_and_sits_next_to_the_target() {
+        let target = std::env::temp_dir().join("some-dir").join("resource_registry.yaml");
+
+        let first = temp_path_for(&target);
+        let second = temp_path_for(&target);
+
+        // Уникальность: с прежним фиксированным именем два писателя попадали
+        // в один путь, и второй мог наложиться на первого до `rename`.
+        assert_ne!(
+            first, second,
+            "два вызова дали одно имя — второй писатель затрёт первого"
+        );
+
+        // Тот же каталог: именно это делает `rename` атомарным. Переезд между
+        // файловыми системами превратил бы подмену в копирование.
+        assert_eq!(
+            first.parent(),
+            target.parent(),
+            "временный файл ушёл из каталога цели — rename перестанет быть атомарным"
+        );
+        assert_eq!(second.parent(), target.parent());
+
+        // Расширение прежнее: уборка остатков ищет именно `.tmp`.
+        for candidate in [&first, &second] {
+            assert!(
+                candidate
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".tmp"),
+                "{candidate:?} не оканчивается на .tmp"
+            );
+        }
     }
 
     /// Сколько пар одновременных записей прогоняет тест гонки.
