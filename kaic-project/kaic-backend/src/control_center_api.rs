@@ -493,22 +493,11 @@ async fn run_video_pipeline(
                 tracing::error!("не удалось сохранить путь результата {task_id}: {err:#}");
             }
 
-            if let Err(err) = task_store
-                .append_context(
-                    task_id,
-                    ContextEntry {
-                        role: "assistant".to_string(),
-                        content: summary,
-                        at: Utc::now(),
-                    },
-                )
-                .await
-            {
-                tracing::error!("не удалось сохранить план для задачи {task_id}: {err:#}");
-            }
-            if let Err(err) = task_store.set_status(task_id, TaskStatus::Done).await {
-                tracing::error!("не удалось обновить статус задачи {task_id}: {err:#}");
-            }
+            // Тот же порядок, что и в текстовом пайплайне: сначала заявка на
+            // статус, потом роль записи. Видео-задачу отменяют ровно так же,
+            // как текстовую, и результат отменённой не должен выглядеть
+            // ответом.
+            record_outcome(&task_store, task_id, TaskStatus::Done, summary).await;
         }
         // Отказ гейта на всех ассетах — это Failed с внятной причиной, а не
         // паника: задача завершается штатно, причина видна в контексте.
@@ -606,8 +595,74 @@ async fn note(task_store: &Arc<TaskStore>, task_id: Uuid, content: String) {
 async fn fail_task(task_store: &Arc<TaskStore>, task_id: Uuid, reason: String) {
     tracing::warn!("медиа-задача {task_id} не выполнена: {reason}");
     note(task_store, task_id, format!("Ошибка: {reason}")).await;
-    if let Err(err) = task_store.set_status(task_id, TaskStatus::Failed).await {
-        tracing::error!("не удалось обновить статус задачи {task_id}: {err:#}");
+    if !claim_finish(task_store, task_id, TaskStatus::Failed).await {
+        tracing::warn!(
+            "задача {task_id}: отказ пришёл после того, как статус сменил человек — \
+             отмена не переписана на Failed"
+        );
+    }
+}
+
+/// Записывает итоговый статус фоновой работы, не затирая решение человека.
+///
+/// `true` — статус записан; `false` — задача уже не выполняется, потому что
+/// её отменили, приостановили или продолжили, пока фон работал.
+///
+/// Ошибка записи возвращает `false` намеренно: неизвестно, применилась она
+/// или нет, и считать её успехом значило бы дать вызывающему записать
+/// результат ролью `assistant` под непонятным статусом.
+async fn claim_finish(task_store: &Arc<TaskStore>, task_id: Uuid, status: TaskStatus) -> bool {
+    match task_store.finish_if_still_running(task_id, status).await {
+        Ok(applied) => applied,
+        Err(err) => {
+            tracing::error!("не удалось обновить статус задачи {task_id}: {err:#}");
+            false
+        }
+    }
+}
+
+/// Кладёт результат фоновой работы в задачу — ответом, если задача его ещё
+/// ждёт, и помеченной заметкой, если человек успел от неё отказаться.
+///
+/// Молча выбросить результат было бы новым молчаливым отказом — тем самым
+/// классом, который здесь и чинится. Через месяц никто не поймёт, почему GPU
+/// был занят полчаса на отменённой задаче, если от этой работы не осталось
+/// следа. Поэтому текст сохраняется всегда; меняется только его роль.
+///
+/// Роль `system`, а не `assistant`, и это не косметика: Telegram-мост берёт
+/// ПОСЛЕДНЮЮ запись роли `assistant` и отправляет её человеку как ответ.
+/// Результат отменённой задачи, положенный ролью `assistant`, уехал бы в
+/// Telegram как полноценный ответ — то есть отмена снова была бы отменена,
+/// только другим путём.
+async fn record_outcome(
+    task_store: &Arc<TaskStore>,
+    task_id: Uuid,
+    status: TaskStatus,
+    content: String,
+) {
+    let entry = if claim_finish(task_store, task_id, status).await {
+        ContextEntry {
+            role: "assistant".to_string(),
+            content,
+            at: Utc::now(),
+        }
+    } else {
+        tracing::warn!(
+            "задача {task_id}: работа завершилась после того, как статус сменил человек — \
+             результат сохранён пометкой, ответом не считается"
+        );
+        ContextEntry {
+            role: "system".to_string(),
+            content: format!(
+                "Работа завершилась уже после того, как задача была отменена или изменена. \
+                 Ответом задачи этот текст не является:\n\n{content}"
+            ),
+            at: Utc::now(),
+        }
+    };
+
+    if let Err(err) = task_store.append_context(task_id, entry).await {
+        tracing::error!("не удалось сохранить результат задачи {task_id}: {err:#}");
     }
 }
 
@@ -666,28 +721,23 @@ async fn run_task_pipeline(
                 started.elapsed().as_secs_f64(),
                 response.content.chars().count()
             );
-            let append_result = task_store
-                .append_context(
-                    task_id,
-                    ContextEntry {
-                        role: "assistant".to_string(),
-                        content: response.content,
-                        at: Utc::now(),
-                    },
-                )
-                .await;
-            if let Err(err) = append_result {
-                tracing::error!("не удалось сохранить ответ модели для задачи {task_id}: {err:#}");
-            }
-            if let Err(err) = task_store.set_status(task_id, TaskStatus::Done).await {
-                tracing::error!("не удалось обновить статус задачи {task_id}: {err:#}");
-            }
+            // Статус решается ПЕРВЫМ, до записи ответа: только он говорит,
+            // является ли пришедший текст ответом задачи или результатом
+            // работы, от которой человек успел отказаться. Прежде порядок
+            // был обратным, и ответ ложился ролью `assistant` независимо ни
+            // от чего — то есть отменённая задача получала полноценный
+            // ответ, который Telegram-мост потом и отправлял.
+            record_outcome(&task_store, task_id, TaskStatus::Done, response.content).await;
         }
         Err(err) => {
             tracing::warn!(
                 "задача {task_id} завершена: failed за {:.1} с — {err:#}",
                 started.elapsed().as_secs_f64()
             );
+            // Причина пишется всегда — она объясняет, чем занималась система,
+            // даже если задачу уже отменили. А вот статус Failed ставится
+            // только если задача его ещё ждёт: отменённая задача не должна
+            // становиться упавшей, человек её не запускал заново.
             let append_result = task_store
                 .append_context(
                     task_id,
@@ -701,8 +751,11 @@ async fn run_task_pipeline(
             if let Err(e) = append_result {
                 tracing::error!("не удалось сохранить ошибку для задачи {task_id}: {e:#}");
             }
-            if let Err(e) = task_store.set_status(task_id, TaskStatus::Failed).await {
-                tracing::error!("не удалось обновить статус задачи {task_id}: {e:#}");
+            if !claim_finish(&task_store, task_id, TaskStatus::Failed).await {
+                tracing::warn!(
+                    "задача {task_id}: отказ пришёл после того, как статус сменил человек — \
+                     решение человека сохранено"
+                );
             }
         }
     }
@@ -1036,6 +1089,230 @@ mod tests {
                 retrieved_at: Utc::now(),
             }),
         }
+    }
+
+    // --- Отмена задачи ---------------------------------------------------
+
+    /// Backend, который «думает» заданное время и возвращает текст.
+    ///
+    /// Настоящая модель здесь не нужна и не разрешена: предмет проверки —
+    /// что делает система со статусом, когда генерация завершается ПОСЛЕ
+    /// отмены. Содержимое ответа к этому отношения не имеет, а время
+    /// генерации должно быть миллисекундами, а не минутами.
+    struct SlowFakeBackend {
+        generate_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model_backend::ModelBackend for SlowFakeBackend {
+        async fn is_loaded(&self, _model: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn load(&self, _model: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn unload(&self, _model: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn generate(
+            &self,
+            _model: &str,
+            _request: crate::model_backend::GenerateRequest,
+        ) -> anyhow::Result<crate::model_backend::GenerateResponse> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.generate_ms)).await;
+            Ok(crate::model_backend::GenerateResponse {
+                content: "ответ модели".to_string(),
+            })
+        }
+    }
+
+    fn pipeline_fixture(generate_ms: u64) -> (AppState, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kaic-cancel-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let resources = dir.join("resource_registry.yaml");
+        std::fs::write(&resources, "Fake:\n  vram_mb: 1000\n  load_seconds: 1\n").unwrap();
+        let capabilities = dir.join("capability_registry.yaml");
+        std::fs::write(&capabilities, "Simple:\n  primary: Fake\n").unwrap();
+
+        let resource_registry = Arc::new(ResourceRegistry::from_file(&resources).unwrap());
+        let scheduler = Arc::new(Scheduler::new(
+            Arc::new(
+                crate::capability_registry::CapabilityRegistry::from_file(&capabilities).unwrap(),
+            ),
+            resource_registry.clone(),
+            Arc::new(SlowFakeBackend { generate_ms }),
+            24495,
+        ));
+        let task_store = Arc::new(TaskStore::new(":memory:").unwrap());
+
+        (
+            AppState {
+                task_store,
+                scheduler,
+                resource_registry,
+            },
+            dir,
+        )
+    }
+
+    async fn status_of(state: &AppState, id: Uuid) -> TaskStatus {
+        state
+            .task_store
+            .get(id)
+            .await
+            .expect("задача читается")
+            .expect("задача существует")
+            .status
+    }
+
+    /// Главный дефект: человек отменил, система подтвердила отмену, а
+    /// завершившаяся генерация молча вернула задачу в Done.
+    ///
+    /// Отмена идёт через САМ обработчик `cancel_task`, а не мимо него —
+    /// иначе проверялся бы не тот путь, которым пользуется человек.
+    #[tokio::test]
+    async fn a_cancelled_task_stays_cancelled_after_the_generation_finishes() {
+        let (state, dir) = pipeline_fixture(400);
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        let pipeline = tokio::spawn(run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        ));
+
+        // Отменяем, пока генерация идёт.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        match cancel_task(State(state.clone()), Path(task.id)).await {
+            Ok(code) => assert_eq!(code, StatusCode::OK, "отмена обязана вернуть 200"),
+            Err(_) => panic!("обработчик отмены отказал"),
+        }
+        assert_eq!(
+            status_of(&state, task.id).await,
+            TaskStatus::Cancelled,
+            "отмена не записалась — проверять дальше нечего"
+        );
+
+        pipeline.await.expect("пайплайн не паниковал");
+
+        assert_eq!(
+            status_of(&state, task.id).await,
+            TaskStatus::Cancelled,
+            "завершившаяся генерация переписала отмену"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Результат, досчитанный после отмены, обязан остаться в задаче — но не
+    /// ответом.
+    ///
+    /// Молча выбросить его было бы новым молчаливым отказом. Положить его
+    /// ролью `assistant` — тоже отказ, только хитрее: Telegram-мост берёт
+    /// последнюю запись этой роли и отправляет её человеку, то есть отменённая
+    /// задача всё равно вернула бы ответ.
+    #[tokio::test]
+    async fn work_finished_after_a_cancel_is_kept_but_not_as_the_answer() {
+        let (state, dir) = pipeline_fixture(400);
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        let pipeline = tokio::spawn(run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let _ = cancel_task(State(state.clone()), Path(task.id)).await;
+        pipeline.await.expect("пайплайн не паниковал");
+
+        let context = state
+            .task_store
+            .get(task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .context;
+
+        assert!(
+            context.iter().all(|e| e.role != "assistant"),
+            "результат отменённой задачи лёг ответом — Telegram отправит его человеку"
+        );
+        let trace = context
+            .iter()
+            .find(|e| e.content.contains("ответ модели"))
+            .expect("работа, которую сделал GPU, обязана оставить след");
+        assert_eq!(trace.role, "system");
+        assert!(
+            trace.content.contains("отменена"),
+            "след не объясняет, почему это не ответ: {}",
+            trace.content
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Терминальность сделана НЕ глобальной, и это намеренно: команда
+    /// человека обязана применяться всегда. Если бы `set_status` запрещал
+    /// уход с `Cancelled`, продолжение отменённой задачи молча ничего бы не
+    /// делало — то есть починка одного молчаливого отказа создала бы другой.
+    #[tokio::test]
+    async fn a_human_command_can_still_move_a_cancelled_task() {
+        let (state, dir) = pipeline_fixture(1);
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        let _ = cancel_task(State(state.clone()), Path(task.id)).await;
+        assert_eq!(status_of(&state, task.id).await, TaskStatus::Cancelled);
+
+        // Тот же безусловный путь, которым пользуются cancel/pause/continue.
+        state
+            .task_store
+            .set_status(task.id, TaskStatus::Running)
+            .await
+            .expect("команда человека применяется безусловно");
+        assert_eq!(status_of(&state, task.id).await, TaskStatus::Running);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Парная проверка: без неё тест выше зеленел бы и от того, что пайплайн
+    /// вообще не доходит до записи статуса — например если бы подбор модели
+    /// отказал и до генерации дело не дошло.
+    #[tokio::test]
+    async fn a_task_nobody_cancelled_still_reaches_done() {
+        let (state, dir) = pipeline_fixture(400);
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            status_of(&state, task.id).await,
+            TaskStatus::Done,
+            "неотменённая задача обязана дойти до Done"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
