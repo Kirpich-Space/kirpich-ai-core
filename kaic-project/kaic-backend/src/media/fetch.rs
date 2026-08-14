@@ -260,6 +260,15 @@ mod tests {
     use crate::media::provenance::{LicensedProvenance, UserProvenance};
     use chrono::Utc;
 
+    /// Тот же клиент, что и в бою: проверять поведение загрузки на клиенте
+    /// с другими таймаутами значило бы проверять не тот контур.
+    fn media_client() -> reqwest::Client {
+        crate::http_client::build(
+            crate::http_client::CONNECT_TIMEOUT,
+            crate::http_client::MEDIA_TIMEOUT,
+        )
+    }
+
     fn entry(kind: MediaKind, provenance: Provenance) -> ManifestEntry {
         ManifestEntry {
             asset_id: "openverse:abc-123".to_string(),
@@ -321,7 +330,7 @@ mod tests {
         );
 
         let result = fetch_and_verify(
-            &reqwest::Client::new(),
+            &media_client(),
             &entry,
             &std::env::temp_dir().join("kaic-fetch-test"),
         )
@@ -337,7 +346,7 @@ mod tests {
         let entry = entry(MediaKind::Audio, licensed());
 
         let result = fetch_and_verify(
-            &reqwest::Client::new(),
+            &media_client(),
             &entry,
             &std::env::temp_dir().join("kaic-fetch-test"),
         )
@@ -364,7 +373,7 @@ mod tests {
         });
 
         let result = fetch_and_verify(
-            &reqwest::Client::new(),
+            &media_client(),
             &e,
             &std::env::temp_dir().join("kaic-fetch-test"),
         )

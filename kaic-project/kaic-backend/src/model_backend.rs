@@ -138,10 +138,30 @@ impl LmStudioBackend {
     /// `base_url` — например `http://localhost:1234`.
     /// `api_token` — если в LM Studio включена авторизация; иначе `None`.
     pub fn new(base_url: impl Into<String>, api_token: Option<String>) -> Self {
+        Self::with_timeouts(
+            base_url,
+            api_token,
+            crate::http_client::CONNECT_TIMEOUT,
+            crate::http_client::LM_STUDIO_TIMEOUT,
+        )
+    }
+
+    /// Тот же конструктор с явно заданными таймаутами.
+    ///
+    /// Существует ради проверки поведения при недоступном адресате:
+    /// умолчание на ответ — 30 минут, и тест, ждущий его срабатывания, был
+    /// бы не тестом, а простоем. Отдельный конструктор честнее, чем
+    /// сокращённое «на время тестов» умолчание в самом `new`.
+    pub fn with_timeouts(
+        base_url: impl Into<String>,
+        api_token: Option<String>,
+        connect: std::time::Duration,
+        response: std::time::Duration,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_token,
-            client: reqwest::Client::new(),
+            client: crate::http_client::build(connect, response),
             instance_ids: Mutex::new(HashMap::new()),
         }
     }
@@ -385,6 +405,100 @@ mod wire_tests {
             json.get("temperature").and_then(|v| v.as_f64()),
             Some(0.7_f32 as f64)
         );
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Сервер, который принимает соединение и молчит.
+    ///
+    /// Именно этот отказ, а не «порт закрыт»: закрытый порт отвергает
+    /// соединение мгновенно и висеть не даёт вовсе, поэтому он ничего не
+    /// проверяет. Опасен ровно противоположный случай — TCP установлен,
+    /// ответа нет. До таймаута он подвешивал задачу навсегда.
+    async fn silent_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("порт для подставного сервера нашёлся");
+        let addr = listener.local_addr().expect("адрес известен");
+        let handle = tokio::spawn(async move {
+            // Соединения удерживаются, а не закрываются: закрытие дало бы
+            // клиенту ошибку сразу и снова ничего бы не проверило.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn generation_fails_on_time_instead_of_hanging_forever() {
+        let (base_url, server) = silent_server().await;
+        let backend = LmStudioBackend::with_timeouts(
+            base_url,
+            None,
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = backend
+            .generate(
+                "любая",
+                GenerateRequest {
+                    messages: Vec::new(),
+                    temperature: None,
+                },
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "молчащий сервер обязан дать ошибку, а не ответ"
+        );
+        // Верхняя граница — предсказуемость: без таймаута этот вызов не
+        // завершается вообще, и тест не «падал» бы, а висел.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "отказ занял {elapsed:?} — это не предсказуемое время"
+        );
+        // Нижняя граница — что сработал именно таймаут, а не отказ
+        // соединения: иначе тест зеленел бы и с оборванным сервером.
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "отказ пришёл раньше таймаута ({elapsed:?}) — сработало что-то другое"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_management_calls_are_capped_too() {
+        // Таймаут стоит на клиенте, а не на одном вызове: `load` в
+        // Scheduler'е держит `gpu_lock`, и повисший `load` заблокировал бы
+        // не одну задачу, а любую смену набора моделей.
+        let (base_url, server) = silent_server().await;
+        let backend = LmStudioBackend::with_timeouts(
+            base_url,
+            None,
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        );
+
+        let started = std::time::Instant::now();
+        assert!(backend.load("любая").await.is_err());
+        assert!(backend.is_loaded("любая").await.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "управляющие вызовы не уложились в предсказуемое время"
+        );
+
+        server.abort();
     }
 }
 

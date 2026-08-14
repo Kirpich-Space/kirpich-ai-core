@@ -288,7 +288,14 @@ impl BridgeState {
     pub fn new(config: TelegramConfig) -> Self {
         Self {
             config: Arc::new(config),
-            http: reqwest::Client::new(),
+            // Обращения моста — только к нашему же Control Center API на
+            // localhost, и оба штатно отвечают за миллисекунды. Без
+            // таймаута недоступный backend подвешивал бы обработчик
+            // сообщения Telegram навсегда.
+            http: crate::http_client::build(
+                crate::http_client::CONNECT_TIMEOUT,
+                crate::http_client::CONTROL_CENTER_TIMEOUT,
+            ),
             approvals: Arc::new(Mutex::new(Approvals::default())),
             owner: Arc::new(OwnerGuard::new(OWNER_FILE)),
         }

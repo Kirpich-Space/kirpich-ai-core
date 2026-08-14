@@ -310,7 +310,13 @@ async fn run_video_pipeline(
     )
     .await;
 
-    let client = reqwest::Client::new();
+    // Один клиент на весь проход: и поиск в Openverse, и скачивание
+    // ассетов. Без таймаута зависший источник оставлял бы задачу в
+    // InProgress навсегда — статуса «повисла» в системе нет.
+    let client = crate::http_client::build(
+        crate::http_client::CONNECT_TIMEOUT,
+        crate::http_client::MEDIA_TIMEOUT,
+    );
 
     // Источник требует совпадения ВСЕХ слов запроса, поэтому лишнее слово не
     // уточняет выдачу, а обнуляет её. Пробуем от самого узкого варианта к
