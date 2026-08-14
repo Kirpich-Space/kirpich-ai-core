@@ -307,12 +307,24 @@ impl ModelBackend for LmStudioBackend {
             .await
             .context("не удалось разобрать ответ LM Studio")?;
 
+        // Пустой `choices` — это НЕ ответ пустой строкой, а несостоявшийся
+        // ответ: провайдер обязан вернуть хотя бы один вариант. Раньше здесь
+        // стоял `unwrap_or_default()`, и разница стиралась молча — задача
+        // уходила в Done с пустым сообщением ассистента, а медиа-контур
+        // тихо сползал на дословный текст задачи. Механизм работал, отказ
+        // был не виден: тот же сюжет, что с `decode_to_string` в
+        // kaic-terminal, писавшим в `String` нулевой ёмкости.
+        //
+        // Граница намеренная: пустая СТРОКА внутри присутствующего варианта
+        // остаётся `Ok`. Это ответ, пусть и бессодержательный — провайдер
+        // своё обещание выполнил, а «модель ничего не сказала» решается не
+        // здесь.
         let content = response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .unwrap_or_default();
+            .context("LM Studio вернула ответ без вариантов (пустой choices)")?;
 
         Ok(GenerateResponse { content })
     }
@@ -473,6 +485,98 @@ mod timeout_tests {
             elapsed >= Duration::from_millis(300),
             "отказ пришёл раньше таймаута ({elapsed:?}) — сработало что-то другое"
         );
+
+        server.abort();
+    }
+
+    /// Сервер, отдающий один и тот же заранее заданный JSON.
+    ///
+    /// Нужен, чтобы проверить разбор ответа провайдера, не поднимая
+    /// LM Studio и не загружая ни одной модели.
+    async fn server_answering(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("порт для подставного сервера нашёлся");
+        let addr = listener.local_addr().expect("адрес известен");
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Запрос надо вычитать, иначе клиент получит обрыв вместо
+                    // ответа. Тело запроса здесь заведомо меньше буфера.
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn empty_request() -> GenerateRequest {
+        GenerateRequest {
+            messages: Vec::new(),
+            temperature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_choices_is_an_error_not_an_empty_string() {
+        // Провайдер обязан вернуть хотя бы один вариант. Пустой `choices` —
+        // это несостоявшийся ответ, а не ответ пустой строкой, и раньше
+        // `unwrap_or_default()` стирал разницу молча: задача уходила в Done
+        // с пустым сообщением ассистента.
+        let (base_url, server) = server_answering(r#"{"choices":[]}"#).await;
+        let backend = LmStudioBackend::with_timeouts(
+            base_url,
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+
+        // `match`, а не `expect_err`: тот требует `Debug` на типе ответа, а
+        // трогать объявление `GenerateResponse` эта задача не должна.
+        let text = match backend.generate("любая", empty_request()).await {
+            Ok(response) => panic!(
+                "ответ без вариантов обязан быть отказом, а вернулось Ok({:?})",
+                response.content
+            ),
+            Err(err) => format!("{err:#}"),
+        };
+        // Текст пинуется целиком, а не подстрокой: он уходит в контекст
+        // задачи как «Ошибка: {текст}» и читается человеком. Общее
+        // «ошибка генерации» было бы тем же молчаливым отказом, только с
+        // другим лицом.
+        assert_eq!(text, "LM Studio вернула ответ без вариантов (пустой choices)");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_answer_still_comes_through() {
+        // Парная проверка: без неё тест выше зеленел бы и от сломанной
+        // оснастки — например если бы подставной сервер вообще не отвечал.
+        let (base_url, server) =
+            server_answering(r#"{"choices":[{"message":{"content":"горное озеро"}}]}"#).await;
+        let backend = LmStudioBackend::with_timeouts(
+            base_url,
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+
+        let response = backend
+            .generate("любая", empty_request())
+            .await
+            .expect("нормальный ответ обязан пройти");
+
+        assert_eq!(response.content, "горное озеро");
 
         server.abort();
     }
