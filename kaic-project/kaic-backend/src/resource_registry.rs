@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -139,6 +139,25 @@ pub struct ResourceRegistry {
     ///
     /// Источник правды на диске — YAML: сюда пишется то же, что туда.
     temperature_overrides: RwLock<HashMap<String, Option<f32>>>,
+
+    /// Сериализует записи: весь путь чтение → правка → запись под ним.
+    ///
+    /// Чего НЕ хватало раньше: `RwLock` выше берётся уже после `rename` и
+    /// только на вставку в карту. Он охраняет кэш, а гонялись за файл —
+    /// защитить от неё он не мог в принципе. Два вызова на разные модели
+    /// читали один и тот же исходный текст, каждый вносил свою однострочную
+    /// правку, каждый делал `rename`, и побеждал последний целиком. Замер:
+    /// 200 пар из 200 теряли одну из двух правок, причём диск расходился с
+    /// кэшем и следа не оставалось (см. тест
+    /// `concurrent_writes_keep_the_file_and_the_cache_in_agreement`).
+    ///
+    /// `Mutex<()>`, а не `RwLock`: читателей у этого пути нет — под ним
+    /// только запись.
+    ///
+    /// Чего он НЕ решает, сознательно: одновременную правку файла ДРУГИМ
+    /// процессом. Против неё нужна блокировка средствами ОС, и она
+    /// несоразмерна — писатель сегодня ровно один.
+    write_lock: Mutex<()>,
 }
 
 /// Нижняя граница temperature. Не наше решение: провайдер отвергает
@@ -184,6 +203,7 @@ impl ResourceRegistry {
             entries,
             source_path: path.to_path_buf(),
             temperature_overrides: RwLock::new(HashMap::new()),
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -224,11 +244,24 @@ impl ResourceRegistry {
         // рубеж, и он не обязан доверять вызывающему.
         validate_temperature(value).map_err(|e| anyhow::anyhow!(e))?;
 
+        // Лок берётся ПОСЛЕ дешёвых проверок: отвергнутый запрос не должен
+        // стоять в очереди за чужой записью, он и файла не коснётся.
+        //
+        // Отравленный лок (писатель до нас паниковал) — это отказ записать,
+        // а не повод писать поверх неизвестного состояния.
+        let _writing = self
+            .write_lock
+            .lock()
+            .map_err(|e| anyhow::anyhow!("предыдущая запись реестра завершилась паникой: {e}"))?;
+
         let raw = std::fs::read_to_string(&self.source_path)
             .with_context(|| format!("не удалось прочитать {}", self.source_path.display()))?;
         let updated = replace_temperature_line(&raw, model, value)?;
         write_atomically(&self.source_path, &updated)?;
 
+        // Порядок прежний и намеренный: файл первым, кэш вторым. Источник
+        // правды — диск, и кэш не должен утверждать то, чего в файле нет.
+        // При отказе записи мы сюда не доходим вовсе, и кэш остаётся верным.
         self.temperature_overrides
             .write()
             .map_err(|e| anyhow::anyhow!("не удалось обновить кэш temperature: {e}"))?
@@ -481,6 +514,103 @@ Fable9B:
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Сколько пар одновременных записей прогоняет тест гонки.
+    ///
+    /// Было 200 при разведке — гонка воспроизводилась 200 раз из 200, то есть
+    /// детерминированно. Для постоянного теста столько не нужно: даже если
+    /// будущая частичная правка сделает гонку редкой (скажем, 1 случай из 10),
+    /// 50 пар поймают её с вероятностью 99.5%. Взято 50, а не 200, ровно по
+    /// той причине, по которой тест вообще имеет смысл: медленный тест
+    /// выключают, а выключенный тест не ловит ничего.
+    const RACE_PAIRS: usize = 50;
+
+    /// Значение temperature, записанное в файле, для одной модели.
+    ///
+    /// Читается разбором YAML, а не поиском подстроки: подстрока «0.1» нашлась
+    /// бы и в чужом блоке, и тест зеленел бы на потерянной правке.
+    fn temperature_on_disk(path: &Path, model: &str) -> Option<f32> {
+        let raw = std::fs::read_to_string(path).expect("реестр читается");
+        let parsed: HashMap<String, ResourceEntry> =
+            serde_yaml::from_str(&raw).expect("реестр на диске обязан разбираться");
+        parsed.get(model).expect("модель есть в файле").temperature
+    }
+
+    /// Две одновременные записи на РАЗНЫЕ модели не должны терять правку и не
+    /// должны разводить диск с кэшем.
+    ///
+    /// Почему тест постоянный, а не разовая разведка: `Mutex` в
+    /// `set_temperature` не имеет видимой причины — путь чтение-правка-запись
+    /// выглядит коротким и безобидным. Через полгода первый же рефакторинг
+    /// снимет лок как лишний. Этот тест — единственное, что объясняет, зачем
+    /// он там, и единственное, что заметит его снятие.
+    ///
+    /// Проверяется НЕ целостность файла. Файл при гонке оставался валидным —
+    /// ломалось другое: правка одной из моделей пропадала с диска, но
+    /// оставалась в кэше. До перезапуска система работала по кэшу, после —
+    /// молча по файлу, и следа не оставалось нигде. Поэтому сверяется именно
+    /// согласованность диска и кэша.
+    #[test]
+    fn concurrent_writes_keep_the_file_and_the_cache_in_agreement() {
+        use std::sync::Arc as StdArc;
+
+        let dir = std::env::temp_dir().join(format!("kaic-registry-race-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resource_registry.yaml");
+
+        let mut disagreements = Vec::new();
+        for round in 0..RACE_PAIRS {
+            // Каждый раунд начинается с чистого файла: иначе потеря одного
+            // раунда маскировала бы результат следующего.
+            std::fs::write(
+                &path,
+                "# шапка с обоснованием\n\
+                 Fable9B:\n  vram_mb: 1\n  load_seconds: 1\n  temperature: null\n\n\
+                 Nemotron:\n  vram_mb: 2\n  load_seconds: 2\n  temperature: null\n",
+            )
+            .unwrap();
+            let registry = StdArc::new(ResourceRegistry::from_file(&path).unwrap());
+
+            let writers: Vec<_> = [("Fable9B", 0.1_f32), ("Nemotron", 0.9_f32)]
+                .into_iter()
+                .map(|(model, value)| {
+                    let registry = registry.clone();
+                    std::thread::spawn(move || {
+                        registry.set_temperature(model, Some(value)).expect("запись удалась")
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().expect("писатель не паниковал");
+            }
+
+            for (model, expected) in [("Fable9B", 0.1_f32), ("Nemotron", 0.9_f32)] {
+                let on_disk = temperature_on_disk(&path, model);
+                let in_cache = registry.temperature_for(model);
+                if on_disk != Some(expected) || in_cache != Some(expected) {
+                    disagreements.push(format!(
+                        "раунд {round}, {model}: на диске {on_disk:?}, в кэше {in_cache:?}, \
+                         ожидалось Some({expected})"
+                    ));
+                }
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            disagreements.is_empty(),
+            "диск и кэш разошлись в {} случаях из {}:\n{}",
+            disagreements.len(),
+            RACE_PAIRS * 2,
+            disagreements
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     fn sample_registry() -> ResourceRegistry {
         let yaml = r#"
 Nemotron:
@@ -505,6 +635,7 @@ Qwen40B:
             // не вызывается, а чтение работает и без источника на диске.
             source_path: PathBuf::from("<test>"),
             temperature_overrides: RwLock::new(HashMap::new()),
+            write_lock: Mutex::new(()),
         }
     }
 
