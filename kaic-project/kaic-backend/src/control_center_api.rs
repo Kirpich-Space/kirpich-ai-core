@@ -36,7 +36,8 @@ use crate::media::openverse;
 use crate::media::provenance::{Manifest, ManifestEntry};
 use crate::media::query as media_query_extract;
 use crate::media::render as media_render;
-use crate::model_backend::{GenerateRequest, Message, Role};
+use crate::mcp::{McpClient, McpServerConfig};
+use crate::model_backend::{GenerateRequest, GenerateResponse, Message, Role};
 use crate::resource_registry::ResourceRegistry;
 // Алиас: axum тоже экспортирует тип `Router`, поэтому наш классификатор
 // задач импортируется под другим именем — иначе имена конфликтуют.
@@ -147,6 +148,7 @@ async fn create_task(
                 role: "user".to_string(),
                 content: body.text,
                 at: Utc::now(),
+                tool_call_id: None,
             },
         )
         .await?;
@@ -198,6 +200,13 @@ const SEARCH_PAGE_SIZE: u8 = 5;
 /// Роль записи контекста, несущей путь к готовому файлу-результату.
 /// Клиенты (Telegram Bridge) читают её напрямую и не разбирают текст сводки.
 pub const ARTIFACT_ROLE: &str = "artifact";
+
+/// Роль записи контекста, несущей результат вызова инструмента.
+///
+/// Отдельная от `assistant` намеренно: результат инструмента — не ответ
+/// модели, и Telegram-мост, читающий последнюю запись роли `assistant`,
+/// не должен принять его за ответ человеку.
+pub const TOOL_ROLE: &str = "tool";
 
 /// Куда складываются скачанные ассеты.
 ///
@@ -486,6 +495,7 @@ async fn run_video_pipeline(
                         role: ARTIFACT_ROLE.to_string(),
                         content: rendered.path.to_string_lossy().to_string(),
                         at: Utc::now(),
+                        tool_call_id: None,
                     },
                 )
                 .await
@@ -523,7 +533,23 @@ async fn extract_search_term(
         .run_with_model(media_query_extract::EXTRACTION_MODEL_LABEL, request)
         .await
     {
-        Ok(response) => response.content,
+        // Инструментов этому шагу не давали, поэтому ответ не-текстом здесь
+        // невозможен. Если он всё же придёт — это отказ, а не повод
+        // домысливать: шаг по построению деградирующий, берём дословный текст.
+        Ok(response) => match response.text() {
+            Some(text) => text.to_string(),
+            None => {
+                note(
+                    task_store,
+                    task_id,
+                    "модель запросила вызов инструмента там, где инструментов нет; \
+                     ищу по тексту задачи"
+                        .to_string(),
+                )
+                .await;
+                return raw_text.to_string();
+            }
+        },
         Err(err) => {
             note(
                 task_store,
@@ -584,6 +610,7 @@ async fn note(task_store: &Arc<TaskStore>, task_id: Uuid, content: String) {
                 role: "system".to_string(),
                 content,
                 at: Utc::now(),
+                tool_call_id: None,
             },
         )
         .await
@@ -645,6 +672,7 @@ async fn record_outcome(
             role: "assistant".to_string(),
             content,
             at: Utc::now(),
+            tool_call_id: None,
         }
     } else {
         tracing::warn!(
@@ -658,6 +686,7 @@ async fn record_outcome(
                  Ответом задачи этот текст не является:\n\n{content}"
             ),
             at: Utc::now(),
+            tool_call_id: None,
         }
     };
 
@@ -672,15 +701,242 @@ async fn record_outcome(
 fn context_to_messages(context: &[ContextEntry]) -> Vec<Message> {
     context
         .iter()
-        .map(|entry| Message {
-            role: match entry.role.as_str() {
-                "user" => Role::User,
-                "assistant" => Role::Assistant,
-                _ => Role::System,
+        .map(|entry| match entry.role.as_str() {
+            "user" => Message::new(Role::User, entry.content.clone()),
+            "assistant" => Message::new(Role::Assistant, entry.content.clone()),
+            // Результат инструмента обязан вернуться модели со СВОИМ
+            // `tool_call_id`: без него провайдер не сопоставит его с вызовом
+            // и отвергнет всю историю. Записи роли `tool` без идентификатора
+            // в базе быть не может — его пишет тот же цикл, что и запись, —
+            // но если она найдётся (старая задача, ручная правка), считаем её
+            // обычной заметкой, а не притворяемся, что связь есть.
+            "tool" => match &entry.tool_call_id {
+                Some(id) => Message::tool_result(id.clone(), entry.content.clone()),
+                None => Message::new(Role::System, entry.content.clone()),
             },
-            content: entry.content.clone(),
+            _ => Message::new(Role::System, entry.content.clone()),
         })
         .collect()
+}
+
+/// Предел шагов цикла «модель → инструмент → модель» на одну задачу.
+///
+/// Восемь, и число не круглое ради красоты. Замер вызова инструментов
+/// (2026-08-13) показал, что модели уверенно держат двухшаговые цепочки:
+/// GPTOSS20 — 3/3 за 7.1–7.9 с, Gemma27 — 3/3 за 30.1–39.3 с. Трёх- и
+/// более шаговых цепочек никто не мерил, то есть верхней границы «сколько
+/// модель осмысленно пройдёт» мы не знаем. Восемь — это вчетверо больше
+/// измеренного и при этом заведомо конечное число: на Gemma27 худший случай
+/// упирается примерно в пять минут, что укладывается в таймаут HTTP-клиента
+/// (1800 с) с запасом.
+///
+/// Предел нужен не для экономии, а потому что зацикливание модели — это
+/// наблюдаемое поведение, а не гипотеза: при исчерпании задача обязана
+/// упасть с внятной причиной, а не крутиться, пока кто-нибудь не заметит.
+const MAX_TOOL_ITERATIONS: usize = 8;
+
+/// Где лежит описание MCP-серверов. Файла нет — инструментов нет, и весь
+/// контур ведёт себя ровно так, как до их появления.
+const MCP_CONFIG_PATH: &str = "config/mcp.yaml";
+
+/// Цикл «модель → инструмент → модель».
+///
+/// Возвращает финальный текст ответа. Инструменты берутся у MCP-сервера,
+/// поднятого на время задачи; если сервера нет, список пуст, и цикл
+/// вырождается в один запрос — то самое поведение, что было до этой задачи.
+async fn run_agent_loop(
+    task_store: &Arc<TaskStore>,
+    scheduler: &Arc<Scheduler>,
+    task_id: Uuid,
+    category: &str,
+    allow_manual: bool,
+    mut messages: Vec<Message>,
+) -> anyhow::Result<String> {
+    // Сервер поднимается ДО занятия модели: если он не встанет, незачем
+    // держать модель занятой всё время его падения.
+    let mcp = match McpServerConfig::load(MCP_CONFIG_PATH)? {
+        Some(config) => match McpClient::connect(&config).await {
+            Ok(client) => Some(client),
+            // Недоступный сервер инструментов — не причина ронять задачу:
+            // модель ответит текстом, как отвечала раньше. Но молчать об
+            // этом нельзя, иначе «модель не воспользовалась инструментом»
+            // не отличить от «инструментов ей не дали».
+            Err(err) => {
+                note(
+                    task_store,
+                    task_id,
+                    format!("MCP-сервер недоступен ({err:#}); работаю без инструментов"),
+                )
+                .await;
+                None
+            }
+        },
+        None => None,
+    };
+
+    let tools = match &mcp {
+        Some(client) => {
+            let tools = client.list_tools().await?;
+            note(
+                task_store,
+                task_id,
+                format!(
+                    "инструменты от '{}': {}",
+                    client.server_name(),
+                    tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            )
+            .await;
+            tools
+        }
+        None => Vec::new(),
+    };
+
+    // Сессия, а не `run`: guard обязан пережить все шаги цикла, включая
+    // паузы на работу инструмента, иначе модель вытеснят между шагами.
+    let session = scheduler.begin_session(category, allow_manual).await?;
+
+    let outcome = agent_steps(task_store, &session, task_id, &mut messages, &tools, mcp.as_ref()).await;
+
+    // Сервер завершается в любом случае — и на успехе, и на ошибке.
+    // Подпроцесс, переживший задачу, накапливался бы молча.
+    if let Some(client) = mcp {
+        if let Err(err) = client.shutdown().await {
+            tracing::warn!("MCP-сервер задачи {task_id} завершился некорректно: {err:#}");
+        }
+    }
+    outcome
+}
+
+/// Собственно шаги цикла — вынесены, чтобы завершение MCP-сервера выше
+/// выполнялось на любом исходе, а не только на успешном.
+async fn agent_steps(
+    task_store: &Arc<TaskStore>,
+    session: &crate::scheduler::Session<'_>,
+    task_id: Uuid,
+    messages: &mut Vec<Message>,
+    tools: &[crate::model_backend::ToolSpec],
+    mcp: Option<&McpClient>,
+) -> anyhow::Result<String> {
+    for step in 1..=MAX_TOOL_ITERATIONS {
+        // История копируется, а не отдаётся: следующий шаг должен видеть всё
+        // накопленное, включая собственные вызовы инструментов и их
+        // результаты. Без полной истории модель на втором шаге не помнит, что
+        // сама же и запрашивала.
+        let request = GenerateRequest {
+            messages: messages.clone(),
+            // temperature подставит Scheduler: только он знает, какая модель
+            // в итоге взяла задачу.
+            temperature: None,
+            tools: tools.to_vec(),
+        };
+
+        match session.generate(request).await? {
+            GenerateResponse::Text(text) => return Ok(text),
+            GenerateResponse::ToolCalls(calls) => {
+                let Some(client) = mcp else {
+                    anyhow::bail!(
+                        "модель запросила вызов инструмента, но MCP-сервер недоступен"
+                    );
+                };
+
+                // Реплика ассистента с вызовами обязана лечь в историю ПЕРЕД
+                // результатами: схема требует, чтобы у каждого сообщения роли
+                // `tool` был предшествующий запрос с тем же идентификатором.
+                messages.push(Message::assistant_tool_calls(calls.clone()));
+
+                for call in calls {
+                    let result = execute_tool(task_store, task_id, client, &call, step).await;
+                    messages.push(Message::tool_result(call.id, result));
+                }
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "модель не завершила задачу за {MAX_TOOL_ITERATIONS} шагов вызова инструментов \
+         на модели '{}' — цикл прерван, чтобы не крутиться бесконечно",
+        session.model()
+    )
+}
+
+/// Исполняет один вызов инструмента и возвращает текст для модели.
+///
+/// Ошибка НЕ возвращается наружу: неудачный инструмент — это результат,
+/// который модель должна увидеть и обработать, а не повод уронить задачу.
+/// Модель, получившая «инструмент отказал», обычно пробует иначе; задача,
+/// упавшая на первом отказе, не пробует ничего.
+///
+/// Всё, что здесь происходит, записывается в контекст задачи. Инструменты
+/// исполняются без подтверждения человеком (см. долги), и единственное, что
+/// делает их действия обозримыми, — этот след.
+async fn execute_tool(
+    task_store: &Arc<TaskStore>,
+    task_id: Uuid,
+    client: &McpClient,
+    call: &crate::model_backend::ToolCall,
+    step: usize,
+) -> String {
+    note(
+        task_store,
+        task_id,
+        format!(
+            "шаг {step}: модель вызывает инструмент '{}' с аргументами {}",
+            call.name, call.arguments
+        ),
+    )
+    .await;
+
+    // Аргументы разбираются здесь, а не в `model_backend`: кривой JSON от
+    // модели — штатное явление, и он должен вернуться ей текстом ошибки, а не
+    // уронить разбор всего ответа провайдера.
+    let arguments = if call.arguments.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_str(&call.arguments) {
+            Ok(value) => value,
+            Err(err) => {
+                let message = format!(
+                    "ОШИБКА ИНСТРУМЕНТА: аргументы не разобрались как JSON ({err}); \
+                     пришло: {}",
+                    call.arguments
+                );
+                note(task_store, task_id, message.clone()).await;
+                return message;
+            }
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let result = match client.call_tool(&call.name, arguments).await {
+        Ok(text) => text,
+        Err(err) => format!("ОШИБКА ИНСТРУМЕНТА: {err:#}"),
+    };
+
+    // Результат сохраняется ролью `tool` вместе с идентификатором вызова —
+    // это то, ради чего в схеме Task Store появилась колонка.
+    if let Err(err) = task_store
+        .append_context(
+            task_id,
+            ContextEntry {
+                role: TOOL_ROLE.to_string(),
+                content: result.clone(),
+                at: Utc::now(),
+                tool_call_id: Some(call.id.clone()),
+            },
+        )
+        .await
+    {
+        tracing::error!("не удалось сохранить результат инструмента {task_id}: {err:#}");
+    }
+
+    tracing::info!(
+        "задача {task_id}, шаг {step}: инструмент '{}' отработал за {} мс",
+        call.name,
+        started.elapsed().as_millis()
+    );
+
+    result
 }
 
 /// Фоновый пайплайн: Scheduler подбирает и вызывает модель, результат
@@ -707,19 +963,15 @@ async fn run_task_pipeline(
         return;
     }
 
-    // temperature подставит Scheduler: только он знает, какая модель
-    // в итоге возьмёт задачу.
-    let request = GenerateRequest { messages, temperature: None };
-
     let started = std::time::Instant::now();
-    match scheduler.run(&category, allow_manual, request).await {
+    match run_agent_loop(&task_store, &scheduler, task_id, &category, allow_manual, messages).await {
         Ok(response) => {
             // Длина ответа, а не ответ: размер полезен для диагностики,
             // содержимое в лог не идёт.
             tracing::info!(
                 "задача {task_id} завершена: done за {:.1} с, ответ {} символов",
                 started.elapsed().as_secs_f64(),
-                response.content.chars().count()
+                response.chars().count()
             );
             // Статус решается ПЕРВЫМ, до записи ответа: только он говорит,
             // является ли пришедший текст ответом задачи или результатом
@@ -727,7 +979,7 @@ async fn run_task_pipeline(
             // был обратным, и ответ ложился ролью `assistant` независимо ни
             // от чего — то есть отменённая задача получала полноценный
             // ответ, который Telegram-мост потом и отправлял.
-            record_outcome(&task_store, task_id, TaskStatus::Done, response.content).await;
+            record_outcome(&task_store, task_id, TaskStatus::Done, response).await;
         }
         Err(err) => {
             tracing::warn!(
@@ -745,6 +997,7 @@ async fn run_task_pipeline(
                         role: "system".to_string(),
                         content: format!("Ошибка: {err:#}"),
                         at: Utc::now(),
+                        tool_call_id: None,
                     },
                 )
                 .await;
@@ -801,6 +1054,7 @@ async fn continue_task(
                     role: "user".to_string(),
                     content: message,
                     at: Utc::now(),
+                    tool_call_id: None,
                 },
             )
             .await?;
@@ -1120,9 +1374,7 @@ mod tests {
             _request: crate::model_backend::GenerateRequest,
         ) -> anyhow::Result<crate::model_backend::GenerateResponse> {
             tokio::time::sleep(std::time::Duration::from_millis(self.generate_ms)).await;
-            Ok(crate::model_backend::GenerateResponse {
-                content: "ответ модели".to_string(),
-            })
+            Ok(crate::model_backend::GenerateResponse::Text("ответ модели".to_string()))
         }
     }
 
@@ -1288,6 +1540,134 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // --- Цикл вызова инструментов ---------------------------------------
+
+    /// Backend, который ВСЕГДА просит вызвать инструмент и никогда не
+    /// отвечает текстом. Ровно то поведение, ради которого существует предел
+    /// итераций: зацикливание модели — наблюдаемое явление, а не гипотеза.
+    struct AlwaysToolCallsBackend {
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model_backend::ModelBackend for AlwaysToolCallsBackend {
+        async fn is_loaded(&self, _model: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn load(&self, _model: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn unload(&self, _model: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn generate(
+            &self,
+            _model: &str,
+            _request: GenerateRequest,
+        ) -> anyhow::Result<GenerateResponse> {
+            let n = self
+                .seen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(GenerateResponse::ToolCalls(vec![
+                crate::model_backend::ToolCall {
+                    id: format!("call_{n}"),
+                    name: "get_scene_info".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ]))
+        }
+    }
+
+    fn looping_fixture() -> (AppState, std::sync::Arc<std::sync::atomic::AtomicUsize>, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kaic-loop-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("resource_registry.yaml"),
+            "Fake:\n  vram_mb: 1000\n  load_seconds: 1\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("capability_registry.yaml"), "Simple:\n  primary: Fake\n").unwrap();
+
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resource_registry =
+            Arc::new(ResourceRegistry::from_file(dir.join("resource_registry.yaml")).unwrap());
+        let scheduler = Arc::new(Scheduler::new(
+            Arc::new(
+                crate::capability_registry::CapabilityRegistry::from_file(
+                    dir.join("capability_registry.yaml"),
+                )
+                .unwrap(),
+            ),
+            resource_registry.clone(),
+            Arc::new(AlwaysToolCallsBackend { seen: seen.clone() }),
+            24495,
+        ));
+        (
+            AppState {
+                task_store: Arc::new(TaskStore::new(":memory:").unwrap()),
+                scheduler,
+                resource_registry,
+            },
+            seen,
+            dir,
+        )
+    }
+
+    /// Модель, зациклившаяся на вызовах инструмента, обязана упереться в
+    /// предел и уронить задачу с ВНЯТНОЙ причиной — а не крутиться, пока
+    /// кто-нибудь не заметит.
+    #[tokio::test]
+    async fn a_looping_model_hits_the_step_limit_and_fails_out_loud() {
+        let (state, seen, dir) = looping_fixture();
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        // Инструменты недоступны (конфига MCP нет), поэтому цикл обязан
+        // отказать сразу и назвать причину — это тоже внятный отказ, а не
+        // молчаливый обрыв.
+        run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            task.id,
+            "Simple".to_string(),
+            vec![Message::new(Role::User, "сделай что-нибудь")],
+            false,
+        )
+        .await;
+
+        let loaded = state.task_store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Failed, "задача обязана упасть");
+
+        let reason = loaded
+            .context
+            .iter()
+            .find(|e| e.content.starts_with("Ошибка:"))
+            .expect("причина обязана быть в контексте задачи");
+        assert!(
+            reason.content.contains("MCP-сервер недоступен"),
+            "причина не называет, что произошло: {}",
+            reason.content
+        );
+        // Ровно один запрос: без инструментов крутиться незачем.
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_step_limit_is_a_real_bound_not_a_formality() {
+        // Замер 2026-08-13 подтверждал двухшаговые цепочки; предел взят
+        // вчетверо больше измеренного. Ноль или единица обесценили бы цикл,
+        // а сотня не отличалась бы от бесконечности.
+        assert!(MAX_TOOL_ITERATIONS >= 4, "предел меньше измеренных цепочек");
+        assert!(MAX_TOOL_ITERATIONS <= 16, "предел уже не ограничивает");
+    }
+
     /// Парная проверка: без неё тест выше зеленел бы и от того, что пайплайн
     /// вообще не доходит до записи статуса — например если бы подбор модели
     /// отказал и до генерации дело не дошло.
@@ -1318,14 +1698,8 @@ mod tests {
     #[test]
     fn video_query_is_the_user_text_verbatim() {
         let messages = vec![
-            Message {
-                role: Role::System,
-                content: "служебное".to_string(),
-            },
-            Message {
-                role: Role::User,
-                content: "  горный ручей  ".to_string(),
-            },
+            Message::new(Role::System, "служебное".to_string()),
+            Message::new(Role::User, "  горный ручей  ".to_string()),
         ];
 
         // Дословно, только с обрезкой пробелов: никакого разбора запроса.
@@ -1334,16 +1708,10 @@ mod tests {
 
     #[test]
     fn video_task_without_user_text_has_no_query() {
-        let messages = vec![Message {
-            role: Role::System,
-            content: "только служебное".to_string(),
-        }];
+        let messages = vec![Message::new(Role::System, "только служебное".to_string())];
         assert_eq!(media_query(&messages), None);
 
-        let blank = vec![Message {
-            role: Role::User,
-            content: "   ".to_string(),
-        }];
+        let blank = vec![Message::new(Role::User, "   ".to_string())];
         assert_eq!(media_query(&blank), None);
     }
 

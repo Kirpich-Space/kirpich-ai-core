@@ -23,6 +23,8 @@ pub enum Role {
     System,
     User,
     Assistant,
+    /// Результат вызова инструмента, возвращаемый модели.
+    Tool,
 }
 
 impl Role {
@@ -31,14 +33,62 @@ impl Role {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::Tool => "tool",
         }
     }
 }
 
 /// Одно сообщение в истории диалога с моделью.
+#[derive(Debug, Clone)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// Заполняется ТОЛЬКО у роли `Tool` — идентификатор вызова, на который
+    /// это сообщение отвечает. У всех остальных ролей `None`, и тогда поле
+    /// не уходит провайдеру вовсе.
+    pub tool_call_id: Option<String>,
+    /// Заполняется ТОЛЬКО у роли `Assistant`, когда модель попросила вызвать
+    /// инструменты.
+    ///
+    /// Без этого сообщения история невалидна: схема требует, чтобы перед
+    /// результатами роли `tool` стояла реплика ассистента, эти вызовы
+    /// запросившая. Вернуть результат, не вернув запрос, — всё равно что
+    /// отдать ответ на вопрос, которого в переписке нет.
+    pub tool_calls: Vec<ToolCall>,
+}
+
+impl Message {
+    /// Обычное сообщение диалога — без привязки к вызову инструмента.
+    /// Существует, чтобы девятнадцать прежних мест не обрастали
+    /// `tool_call_id: None`, который к ним не относится.
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Реплика ассистента, запросившая вызов инструментов.
+    pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: calls,
+        }
+    }
+
+    /// Результат инструмента, возвращаемый модели.
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: Vec::new(),
+        }
+    }
 }
 
 /// Запрос на генерацию ответа модели.
@@ -47,8 +97,44 @@ pub struct Message {
 /// Agent'у передавать накопленный контекст задачи (см. Task Store) без
 /// изменения этого интерфейса, когда HITL-цикл продолжает работу после
 /// паузы на решение пользователя.
+
+/// Описание одного инструмента, как оно уходит провайдеру.
+///
+/// Нейтрально к источнику: сюда сводятся и инструменты MCP-сервера, и любые
+/// будущие встроенные. Типы `rmcp` за границу `mcp.rs` не выходят — смена SDK
+/// не должна задевать ни этот слой, ни всё, что выше.
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema аргументов — отдаётся провайдеру как есть.
+    pub input_schema: serde_json::Value,
+}
+
+/// Вызов инструмента, который запросила модель.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCall {
+    /// Идентификатор провайдера. Возвращается обратно в сообщении роли
+    /// `tool` — по нему модель сопоставляет результат с запросом, и своим
+    /// его подменять нельзя.
+    pub id: String,
+    pub name: String,
+    /// Аргументы как их прислала модель. Строка, а не разобранный JSON:
+    /// провайдер отдаёт именно строку, и разбор — отдельный шаг, который
+    /// имеет право провалиться, не роняя весь ответ.
+    pub arguments: String,
+}
+
 pub struct GenerateRequest {
     pub messages: Vec<Message>,
+
+    /// Инструменты, доступные модели на этот запрос.
+    ///
+    /// Пустой список — поле НЕ отправляется провайдеру вообще, и поведение
+    /// остаётся ровно прежним, добавления инструментов не было. Это то же
+    /// свойство, что у `temperature: None`, и по той же причине: старые пути
+    /// не должны заметить появления новых.
+    pub tools: Vec<ToolSpec>,
 
     /// Температура сэмплинга. `None` — поле НЕ отправляется провайдеру
     /// вообще, и действует его умолчание. Это важное свойство, а не
@@ -57,10 +143,33 @@ pub struct GenerateRequest {
     pub temperature: Option<f32>,
 }
 
-/// Ответ модели.
-pub struct GenerateResponse {
-    /// Текстовое содержимое ответа.
-    pub content: String,
+/// Ответ модели: текст ЛИБО просьба вызвать инструменты.
+///
+/// Сумма, а не структура с двумя опциональными полями. Причина не
+/// стилистическая: провайдер возвращает ровно одно из двух (`finish_reason`
+/// это и означает), и структура с двумя `Option` допускала бы четыре
+/// состояния, из которых два невозможны. Разбирать невозможные состояния
+/// пришлось бы в каждой из точек потребления.
+pub enum GenerateResponse {
+    /// Модель ответила текстом — обычное завершение.
+    Text(String),
+    /// Модель просит вызвать инструменты и вернуть ей результат.
+    /// Список, а не один вызов: провайдер вправе запросить несколько сразу.
+    ToolCalls(Vec<ToolCall>),
+}
+
+impl GenerateResponse {
+    /// Текст ответа, если модель ответила текстом.
+    ///
+    /// Нужен точкам, которым инструменты не положены вовсе (служебное
+    /// извлечение поискового термина) — им незачем расписывать `match` ради
+    /// ветки, которой у них не бывает.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            GenerateResponse::Text(content) => Some(content),
+            GenerateResponse::ToolCalls(_) => None,
+        }
+    }
 }
 
 /// Единый интерфейс для работы с любым источником LLM.
@@ -286,6 +395,41 @@ impl ModelBackend for LmStudioBackend {
             .map(|m| WireMessage {
                 role: m.role.as_wire_str(),
                 content: &m.content,
+                tool_call_id: m.tool_call_id.as_deref(),
+                tool_calls: if m.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(
+                        m.tool_calls
+                            .iter()
+                            .map(|c| WireToolCallOut {
+                                id: &c.id,
+                                kind: "function",
+                                function: WireToolCallFunctionOut {
+                                    name: &c.name,
+                                    arguments: &c.arguments,
+                                },
+                            })
+                            .collect(),
+                    )
+                },
+            })
+            .collect();
+
+        // Пустой список инструментов означает «инструментов нет», а не
+        // «инструментов ноль»: поле обязано исчезнуть из JSON целиком, иначе
+        // прежние запросы перестали бы быть прежними. То же свойство и та же
+        // причина, что у `temperature`.
+        let tools: Vec<WireTool> = request
+            .tools
+            .iter()
+            .map(|t| WireTool {
+                kind: "function",
+                function: WireFunction {
+                    name: &t.name,
+                    description: &t.description,
+                    parameters: &t.input_schema,
+                },
             })
             .collect();
 
@@ -293,6 +437,7 @@ impl ModelBackend for LmStudioBackend {
             model,
             messages,
             temperature: request.temperature,
+            tools: if tools.is_empty() { None } else { Some(tools) },
         };
 
         let response: ChatCompletionsResponse = self
@@ -319,14 +464,31 @@ impl ModelBackend for LmStudioBackend {
         // остаётся `Ok`. Это ответ, пусть и бессодержательный — провайдер
         // своё обещание выполнил, а «модель ничего не сказала» решается не
         // здесь.
-        let content = response
+        let message = response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| c.message)
             .context("LM Studio вернула ответ без вариантов (пустой choices)")?;
 
-        Ok(GenerateResponse { content })
+        // Просьба вызвать инструменты важнее текста: при `tool_calls` модели
+        // кладут в `content` либо пустоту, либо рассуждение вслух, и принять
+        // его за ответ значило бы оборвать цикл на первом же шаге.
+        let calls = message.tool_calls.unwrap_or_default();
+        if !calls.is_empty() {
+            return Ok(GenerateResponse::ToolCalls(
+                calls
+                    .into_iter()
+                    .map(|c| ToolCall {
+                        id: c.id,
+                        name: c.function.name,
+                        arguments: c.function.arguments,
+                    })
+                    .collect(),
+            ));
+        }
+
+        Ok(GenerateResponse::Text(message.content.unwrap_or_default()))
     }
 }
 
@@ -370,6 +532,48 @@ struct LoadedInstance {
 struct WireMessage<'a> {
     role: &'a str,
     content: &'a str,
+    /// Присутствует только у сообщений роли `tool` — по нему провайдер
+    /// сопоставляет результат с тем вызовом, который сам же и запросил.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    /// Присутствует только у реплики ассистента, запросившей инструменты.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<WireToolCallOut<'a>>>,
+}
+
+#[derive(Serialize)]
+struct WireToolCallOut<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    function: WireToolCallFunctionOut<'a>,
+}
+
+#[derive(Serialize)]
+struct WireToolCallFunctionOut<'a> {
+    name: &'a str,
+    /// Строка, а не объект — так их прислал провайдер, и так же он ждёт их
+    /// обратно. Пересобирать JSON по дороге значило бы менять то, что модель
+    /// считает своей же репликой.
+    arguments: &'a str,
+}
+
+#[derive(Serialize)]
+struct WireTool<'a> {
+    /// Единственное значение, которое понимает схема — `"function"`.
+    #[serde(rename = "type")]
+    kind: &'a str,
+    function: WireFunction<'a>,
+}
+
+#[derive(Serialize)]
+struct WireFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    /// JSON Schema аргументов уходит провайдеру дословно: она пришла от
+    /// MCP-сервера, и переписывать её по дороге значило бы врать модели о
+    /// том, что инструмент принимает.
+    parameters: &'a serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -381,6 +585,10 @@ struct ChatCompletionsRequest<'a> {
     /// ответит ошибкой схемы. Поле должно ИСЧЕЗАТЬ из JSON целиком.
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// Тот же `skip_serializing_if` и по той же причине: запрос без
+    /// инструментов обязан быть побайтово прежним запросом.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<WireTool<'a>>>,
 }
 
 #[cfg(test)]
@@ -390,10 +598,114 @@ mod wire_tests {
     fn body(temperature: Option<f32>) -> serde_json::Value {
         serde_json::to_value(ChatCompletionsRequest {
             model: "any",
-            messages: vec![WireMessage { role: "user", content: "привет" }],
+            messages: vec![WireMessage {
+                role: "user",
+                content: "привет",
+                tool_call_id: None,
+                tool_calls: None,
+            }],
             temperature,
+            tools: None,
         })
         .expect("запрос сериализуется")
+    }
+
+    /// Тело запроса, собранное ПОЛНЫМ путём — из `GenerateRequest`, а не
+    /// вручную. Только так проверяется, что пустой список инструментов
+    /// действительно не доходит до провайдера.
+    fn body_from_request(tools: Vec<ToolSpec>) -> serde_json::Value {
+        let request = GenerateRequest {
+            messages: vec![Message::new(Role::User, "привет")],
+            temperature: None,
+            tools,
+        };
+        let wire_messages: Vec<WireMessage> = request
+            .messages
+            .iter()
+            .map(|m| WireMessage {
+                role: m.role.as_wire_str(),
+                content: &m.content,
+                tool_call_id: m.tool_call_id.as_deref(),
+                tool_calls: None,
+            })
+            .collect();
+        let wire_tools: Vec<WireTool> = request
+            .tools
+            .iter()
+            .map(|t| WireTool {
+                kind: "function",
+                function: WireFunction {
+                    name: &t.name,
+                    description: &t.description,
+                    parameters: &t.input_schema,
+                },
+            })
+            .collect();
+        serde_json::to_value(ChatCompletionsRequest {
+            model: "any",
+            messages: wire_messages,
+            temperature: request.temperature,
+            tools: if wire_tools.is_empty() {
+                None
+            } else {
+                Some(wire_tools)
+            },
+        })
+        .expect("запрос сериализуется")
+    }
+
+    #[test]
+    fn no_tools_means_the_request_is_byte_for_byte_the_old_one() {
+        // Главное требование шага: появление инструментов не должно менять
+        // НИ ОДНОГО прежнего запроса. Пустой список — это «инструментов
+        // нет», а не «инструментов ноль», и ключа в JSON быть не должно.
+        let json = body_from_request(Vec::new());
+        assert!(
+            json.get("tools").is_none(),
+            "ключ tools присутствует у запроса без инструментов: {json}"
+        );
+        // И ни одно сообщение не обросло полями вызова инструментов.
+        let message = &json["messages"][0];
+        assert!(message.get("tool_call_id").is_none(), "{message}");
+        assert!(message.get("tool_calls").is_none(), "{message}");
+    }
+
+    #[test]
+    fn a_tool_reaches_the_provider_with_its_schema_untouched() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "code": { "type": "string" } },
+            "required": ["code"]
+        });
+        let json = body_from_request(vec![ToolSpec {
+            name: "execute_blender_code".to_string(),
+            description: "Выполнить код в Blender".to_string(),
+            input_schema: schema.clone(),
+        }]);
+
+        let tool = &json["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "execute_blender_code");
+        // Схема уходит дословно: переписать её по дороге значило бы соврать
+        // модели о том, что инструмент принимает.
+        assert_eq!(tool["function"]["parameters"], schema);
+    }
+
+    #[test]
+    fn a_tool_result_carries_its_call_id_back() {
+        let message = Message::tool_result("call_42", "{\"ok\":true}");
+        let wire = WireMessage {
+            role: message.role.as_wire_str(),
+            content: &message.content,
+            tool_call_id: message.tool_call_id.as_deref(),
+            tool_calls: None,
+        };
+        let json = serde_json::to_value(wire).expect("сериализуется");
+
+        assert_eq!(json["role"], "tool");
+        // Без идентификатора провайдер не сопоставит результат с вызовом и
+        // отвергнет всю историю.
+        assert_eq!(json["tool_call_id"], "call_42");
     }
 
     #[test]
@@ -464,6 +776,7 @@ mod timeout_tests {
                 GenerateRequest {
                     messages: Vec::new(),
                     temperature: None,
+                    tools: Vec::new(),
                 },
             )
             .await;
@@ -523,6 +836,7 @@ mod timeout_tests {
         GenerateRequest {
             messages: Vec::new(),
             temperature: None,
+            tools: Vec::new(),
         }
     }
 
@@ -545,7 +859,7 @@ mod timeout_tests {
         let text = match backend.generate("любая", empty_request()).await {
             Ok(response) => panic!(
                 "ответ без вариантов обязан быть отказом, а вернулось Ok({:?})",
-                response.content
+                response.text()
             ),
             Err(err) => format!("{err:#}"),
         };
@@ -576,7 +890,47 @@ mod timeout_tests {
             .await
             .expect("нормальный ответ обязан пройти");
 
-        assert_eq!(response.content, "горное озеро");
+        assert_eq!(response.text(), Some("горное озеро"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_answer_becomes_tool_calls_not_text() {
+        // Разбор ответа с `tool_calls` — одна из трёх точек карты, требующих
+        // ветвления. Проверяется на реальной форме ответа провайдера, а не на
+        // сконструированном значении: именно разбор и мог разойтись со схемой.
+        let (base_url, server) = server_answering(
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"call_1","type":"function","function":
+                 {"name":"get_scene_info","arguments":"{}"}}]}}]}"#,
+        )
+        .await;
+        let backend = LmStudioBackend::with_timeouts(
+            base_url,
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+
+        let response = backend
+            .generate("любая", empty_request())
+            .await
+            .expect("ответ разбирается");
+
+        match response {
+            GenerateResponse::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_1");
+                assert_eq!(calls[0].name, "get_scene_info");
+                assert_eq!(calls[0].arguments, "{}");
+            }
+            // Если `content: null` победит `tool_calls`, цикл оборвётся на
+            // первом шаге и модель никогда не получит результат инструмента.
+            GenerateResponse::Text(text) => {
+                panic!("вызов инструмента принят за текст: {text:?}")
+            }
+        }
 
         server.abort();
     }
@@ -618,5 +972,25 @@ struct ChatCompletionsChoice {
 
 #[derive(Deserialize)]
 struct ChatCompletionsMessage {
-    content: String,
+    /// При `tool_calls` провайдер вправе не прислать `content` вовсе —
+    /// поэтому `Option`, а не `String` с умолчанием.
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<WireToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct WireToolCall {
+    id: String,
+    function: WireToolCallFunction,
+}
+
+#[derive(Deserialize)]
+struct WireToolCallFunction {
+    name: String,
+    /// Строка с JSON, а не разобранный объект: провайдер отдаёт именно
+    /// строку, и разбирать её здесь значило бы уронить весь ответ из-за
+    /// одного кривого аргумента.
+    arguments: String,
 }

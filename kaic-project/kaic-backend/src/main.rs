@@ -10,6 +10,7 @@ mod control_center_api;
 #[cfg(feature = "embedded-backend")]
 mod embedded_backend;
 mod http_client;
+mod mcp;
 mod media;
 mod model_backend;
 mod resource_registry;

@@ -187,6 +187,38 @@ pub struct GenerationGuard {
     table: BusyTable,
 }
 
+/// Занятая под многошаговую работу модель.
+///
+/// Существует ради одного свойства: `GenerationGuard` внутри живёт столько
+/// же, сколько сама сессия. Пока она жива, модель нельзя вытеснить — в том
+/// числе в паузах между запросами, когда работает внешний инструмент и
+/// никакой генерации не идёт. Отметка снимается в `Drop` guard'а, то есть и
+/// при обычном возврате, и при ошибке, и при панике.
+pub struct Session<'a> {
+    scheduler: &'a Scheduler,
+    model_id: ModelId,
+    /// Не читается — важен только срок его жизни.
+    _guard: GenerationGuard,
+}
+
+impl Session<'_> {
+    /// Модель, выбранная под эту сессию.
+    pub fn model(&self) -> &str {
+        &self.model_id
+    }
+
+    /// Очередной запрос к той же самой модели.
+    ///
+    /// Подбора здесь нет и быть не должно: модель выбрана один раз при
+    /// открытии сессии, и менять её посреди цикла значило бы отдать половину
+    /// диалога одной модели, а половину другой.
+    pub async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
+        self.scheduler
+            .generate_under_guard(&self.model_id, request)
+            .await
+    }
+}
+
 impl Drop for GenerationGuard {
     fn drop(&mut self) {
         // Отравленный мьютекс тоже разбираем: иначе паника в одной задаче
@@ -572,6 +604,29 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Занимает модель под многошаговую работу и держит её занятой, пока жив
+    /// возвращённый `Session`.
+    ///
+    /// Нужен для цикла вызовов инструментов. `run` подбирает модель, делает
+    /// ОДИН запрос и отпускает `GenerationGuard` — для цикла это неверно:
+    /// между «модель попросила вызвать инструмент» и «мы вернули ей
+    /// результат» проходит время работы инструмента, и в это окно LRU вправе
+    /// выгрузить модель. Следующий шаг цикла пришёл бы к выгруженной модели.
+    ///
+    /// Что при этом НЕ меняется: смысл `MAX_CONCURRENT_TASKS`. Он и раньше
+    /// считал задачи, занимающие модели, и продолжает считать их же — одна
+    /// задача занимает один слот. Изменилась только ДЛИТЕЛЬНОСТЬ удержания:
+    /// слот держится весь цикл, а не один запрос. Это и есть требуемое
+    /// поведение, а не побочный эффект.
+    pub async fn begin_session(&self, category: &str, allow_manual: bool) -> Result<Session<'_>> {
+        let (model_id, guard) = self.acquire(category, allow_manual).await?;
+        Ok(Session {
+            scheduler: self,
+            model_id,
+            _guard: guard,
+        })
+    }
+
     /// Выполняет полный цикл: подбирает модель для категории и получает
     /// от неё ответ на историю сообщений.
     ///
@@ -584,6 +639,18 @@ impl Scheduler {
         allow_manual: bool,
         request: GenerateRequest,
     ) -> Result<GenerateResponse> {
+        let (model_id, guard) = self.acquire(category, allow_manual).await?;
+        self.generate(&model_id, request, guard).await
+    }
+
+    /// Подбор модели и отметка занятости — общая часть `run` и
+    /// `begin_session`. Вынесена целиком, без изменений в правилах: разница
+    /// между ними только в том, как долго живёт `GenerationGuard`.
+    async fn acquire(
+        &self,
+        category: &str,
+        allow_manual: bool,
+    ) -> Result<(ModelId, GenerationGuard)> {
         let running = self.running_generations();
 
         if running >= MAX_CONCURRENT_TASKS {
@@ -627,7 +694,7 @@ impl Scheduler {
                 "категория '{category}': выбрана '{model_id}' (уже загружена, \
                  параллельно с {running} выполняющейся)"
             );
-            return self.generate(&model_id, request, guard).await;
+            return Ok((model_id, guard));
         }
 
         // --- ИСКЛЮЧИТЕЛЬНЫЙ ПУТЬ ---
@@ -654,7 +721,7 @@ impl Scheduler {
             (model_id, guard)
         };
 
-        self.generate(&model_id, request, guard).await
+        Ok((model_id, guard))
     }
 
     /// Первый кандидат категории, который уже загружен. `None` — значит для
@@ -691,11 +758,25 @@ impl Scheduler {
     ) -> Result<GenerateResponse> {
         // Единственное место, где известно, какая модель в итоге взяла
         // задачу — значит и temperature подставлять здесь.
-        let request = self.with_registry_temperature(model_id, request);
-        let provider_key = self.resource_registry.provider_key(model_id);
-        let outcome = self.backend.generate(provider_key, request).await;
+        let outcome = self.generate_under_guard(model_id, request).await;
         drop(guard); // явно, чтобы срок жизни отметки читался, а не угадывался
         outcome
+    }
+
+    /// Один запрос к модели без всякой работы с отметкой занятости.
+    ///
+    /// Отметку держит вызывающий: `generate` — на один вызов, `Session` — на
+    /// весь цикл. Разделение существует только ради этого различия.
+    async fn generate_under_guard(
+        &self,
+        model_id: &str,
+        request: GenerateRequest,
+    ) -> Result<GenerateResponse> {
+        // Единственное место, где известно, какая модель в итоге взяла
+        // задачу — значит и temperature подставлять здесь.
+        let request = self.with_registry_temperature(model_id, request);
+        let provider_key = self.resource_registry.provider_key(model_id);
+        self.backend.generate(provider_key, request).await
     }
 
     /// Выполняет запрос НАЗВАННОЙ моделью, минуя подбор по категории.
@@ -1109,6 +1190,7 @@ mod concurrency_tests {
                         GenerateRequest {
                             messages: Vec::new(),
                             temperature: None,
+                            tools: Vec::new(),
                         },
                     )
                     .await
@@ -1161,6 +1243,7 @@ mod concurrency_tests {
         GenerateRequest {
             messages: Vec::new(),
             temperature: None,
+            tools: Vec::new(),
         }
     }
 
@@ -1401,9 +1484,7 @@ mod budget_tests {
             _model: &str,
             _request: GenerateRequest,
         ) -> Result<GenerateResponse> {
-            Ok(GenerateResponse {
-                content: String::new(),
-            })
+            Ok(GenerateResponse::Text(String::new()))
         }
     }
 
@@ -1434,9 +1515,7 @@ mod budget_tests {
             _model: &str,
             _request: GenerateRequest,
         ) -> Result<GenerateResponse> {
-            Ok(GenerateResponse {
-                content: String::new(),
-            })
+            Ok(GenerateResponse::Text(String::new()))
         }
     }
 
@@ -1512,9 +1591,7 @@ mod budget_tests {
             self.watch.enter();
             tokio::time::sleep(std::time::Duration::from_millis(self.generate_ms)).await;
             self.watch.leave();
-            Ok(GenerateResponse {
-                content: String::new(),
-            })
+            Ok(GenerateResponse::Text(String::new()))
         }
     }
 

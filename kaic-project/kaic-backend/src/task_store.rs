@@ -70,6 +70,21 @@ pub struct ContextEntry {
     pub role: String,
     pub content: String,
     pub at: DateTime<Utc>,
+
+    /// Идентификатор вызова инструмента, на который отвечает эта запись.
+    /// Заполнен только у роли `tool`.
+    ///
+    /// Миграция здесь НЕ трогает схему SQLite, и это не упущение: контекст
+    /// лежит в колонке `context` одним YAML-блобом, а не строками таблицы,
+    /// поэтому новое поле — изменение формата сериализации, а не DDL.
+    /// `serde(default)` делает старые блобы читаемыми: в них ключа нет, и
+    /// разбор даёт `None`. `skip_serializing_if` не даёт ключу засорять
+    /// записи, которым он не нужен, — то есть подавляющему большинству.
+    ///
+    /// Что было бы без `default`: `serde_yaml` отверг бы КАЖДУЮ задачу,
+    /// созданную до этой правки, и Task Store перестал бы читаться целиком.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// Задача целиком: статус, накопленный контекст, привязка к Telegram.
@@ -443,6 +458,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: "Начал монтаж".to_string(),
                     at: Utc::now(),
+                    tool_call_id: None,
                 },
             )
             .await
@@ -454,6 +470,7 @@ mod tests {
                     role: "user".to_string(),
                     content: "Продолжай".to_string(),
                     at: Utc::now(),
+                    tool_call_id: None,
                 },
             )
             .await
@@ -463,6 +480,60 @@ mod tests {
         assert_eq!(loaded.context.len(), 2);
         assert_eq!(loaded.context[0].content, "Начал монтаж");
         assert_eq!(loaded.context[1].content, "Продолжай");
+    }
+
+    /// Задача, записанная ДО появления `tool_call_id`, обязана читаться.
+    ///
+    /// Блоб ниже — не выдумка про формат, а ровно то, что писал прежний код:
+    /// три ключа и ни одного лишнего. Если `serde(default)` с поля снимут,
+    /// этот тест упадёт, а без него отказ был бы куда дороже — Task Store
+    /// перестал бы читаться целиком, вместе со всей историей задач.
+    #[tokio::test]
+    async fn tasks_written_before_the_tool_field_still_load() {
+        let store = memory_store().await;
+        let task = store.create("Programming").await.unwrap();
+
+        // Подкладываем контекст в старом формате напрямую, минуя
+        // append_context: он писал бы уже новый.
+        let legacy = "- role: user\n  content: посчитай\n  at: 2026-08-10T10:00:00Z\n\
+                      - role: assistant\n  content: готово\n  at: 2026-08-10T10:00:05Z\n";
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE tasks SET context = ?1 WHERE id = ?2",
+                rusqlite::params![legacy, task.id.to_string()],
+            )
+            .unwrap();
+        }
+
+        let loaded = store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.context.len(), 2);
+        assert_eq!(loaded.context[0].content, "посчитай");
+        assert_eq!(loaded.context[0].tool_call_id, None);
+        assert_eq!(loaded.context[1].tool_call_id, None);
+    }
+
+    /// Новая запись роли `tool` доходит до диска вместе с идентификатором.
+    #[tokio::test]
+    async fn a_tool_result_keeps_its_call_id_across_a_reload() {
+        let store = memory_store().await;
+        let task = store.create("Programming").await.unwrap();
+
+        store
+            .append_context(
+                task.id,
+                ContextEntry {
+                    role: "tool".to_string(),
+                    content: "{\"objects\": 3}".to_string(),
+                    at: Utc::now(),
+                    tool_call_id: Some("call_7".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let loaded = store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.context[0].tool_call_id.as_deref(), Some("call_7"));
     }
 
     #[tokio::test]
