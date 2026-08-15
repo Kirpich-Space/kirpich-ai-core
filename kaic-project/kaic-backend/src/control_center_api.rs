@@ -61,6 +61,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/tasks/:id/continue", post(continue_task))
         .route("/tasks/:id/pause", post(pause_task))
         .route("/tasks/:id/cancel", post(cancel_task))
+        .route("/tasks/:id/tool-decision", post(tool_decision))
         .route("/models", get(list_models))
         .route("/models/:name/temperature", post(set_model_temperature))
         .route("/status", get(status))
@@ -207,6 +208,25 @@ pub const ARTIFACT_ROLE: &str = "artifact";
 /// модели, и Telegram-мост, читающий последнюю запись роли `assistant`,
 /// не должен принять его за ответ человеку.
 pub const TOOL_ROLE: &str = "tool";
+
+/// Роль записи, несущей ЗАПРОС модели на вызов инструмента.
+///
+/// Отдельная от `assistant`: это не ответ человеку, а намерение, которое
+/// ещё может быть отклонено. Содержимое — JSON `{name, arguments}`, вместе с
+/// `tool_call_id` его хватает, чтобы восстановить историю для модели после
+/// паузы на подтверждение.
+pub const TOOL_REQUEST_ROLE: &str = "tool_request";
+
+/// Роль записи, фиксирующей решение человека «да» по конкретному вызову.
+///
+/// Существует, потому что решение и исполнение разнесены во времени и по
+/// процессам: маршрут подтверждения не держит `GenerationGuard` и исполнять
+/// не вправе — иначе модель вытеснили бы из-под задачи. Отметка переживает
+/// паузу и говорит возобновлённому пайплайну, что вызов разрешён.
+///
+/// Это НЕ обход гейта: отметка — свидетельство, а `ApprovedToolCall`
+/// по-прежнему собирается только в `tool_gate::approve_by_human`.
+pub const TOOL_APPROVAL_ROLE: &str = "tool_approval";
 
 /// Куда складываются скачанные ассеты.
 ///
@@ -714,6 +734,21 @@ fn context_to_messages(context: &[ContextEntry]) -> Vec<Message> {
                 Some(id) => Message::tool_result(id.clone(), entry.content.clone()),
                 None => Message::new(Role::System, entry.content.clone()),
             },
+            // Запрос вызова восстанавливается в реплику ассистента с
+            // `tool_calls` — без неё следующий за ней результат роли `tool`
+            // повис бы без своего запроса, и провайдер отверг бы историю.
+            TOOL_REQUEST_ROLE => match (&entry.tool_call_id, parse_tool_request(&entry.content)) {
+                (Some(id), Some((name, arguments))) => {
+                    Message::assistant_tool_calls(vec![crate::model_backend::ToolCall {
+                        id: id.clone(),
+                        name,
+                        arguments,
+                    }])
+                }
+                // Битая запись не притворяется вызовом: лучше заметка, чем
+                // история, которую провайдер отвергнет целиком.
+                _ => Message::new(Role::System, entry.content.clone()),
+            },
             _ => Message::new(Role::System, entry.content.clone()),
         })
         .collect()
@@ -751,10 +786,18 @@ async fn run_agent_loop(
     category: &str,
     allow_manual: bool,
     mut messages: Vec<Message>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<LoopOutcome> {
+    let config = McpServerConfig::load(MCP_CONFIG_PATH)?;
+    // Список разрешённых читается из конфига и только оттуда. Пустой список —
+    // подтверждать всё; отсутствие конфига — инструментов нет вовсе.
+    let auto_approve = config
+        .as_ref()
+        .map(|c| c.auto_approve.clone())
+        .unwrap_or_default();
+
     // Сервер поднимается ДО занятия модели: если он не встанет, незачем
     // держать модель занятой всё время его падения.
-    let mcp = match McpServerConfig::load(MCP_CONFIG_PATH)? {
+    let mcp = match config {
         Some(config) => match McpClient::connect(&config).await {
             Ok(client) => Some(client),
             // Недоступный сервер инструментов — не причина ронять задачу:
@@ -774,6 +817,11 @@ async fn run_agent_loop(
         None => None,
     };
 
+    let server_name = mcp
+        .as_ref()
+        .map(|c| c.server_name().to_string())
+        .unwrap_or_else(|| "-".to_string());
+
     let tools = match &mcp {
         Some(client) => {
             let tools = client.list_tools().await?;
@@ -781,9 +829,14 @@ async fn run_agent_loop(
                 task_store,
                 task_id,
                 format!(
-                    "инструменты от '{}': {}",
+                    "инструменты от '{}': {}. Без подтверждения разрешены: {}",
                     client.server_name(),
-                    tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                    tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
+                    if auto_approve.is_empty() {
+                        "ничего — каждый вызов требует решения человека".to_string()
+                    } else {
+                        auto_approve.join(", ")
+                    }
                 ),
             )
             .await;
@@ -796,7 +849,17 @@ async fn run_agent_loop(
     // паузы на работу инструмента, иначе модель вытеснят между шагами.
     let session = scheduler.begin_session(category, allow_manual).await?;
 
-    let outcome = agent_steps(task_store, &session, task_id, &mut messages, &tools, mcp.as_ref()).await;
+    let outcome = agent_steps(
+        task_store,
+        &session,
+        task_id,
+        &mut messages,
+        &tools,
+        mcp.as_ref(),
+        &auto_approve,
+        &server_name,
+    )
+    .await;
 
     // Сервер завершается в любом случае — и на успехе, и на ошибке.
     // Подпроцесс, переживший задачу, накапливался бы молча.
@@ -817,7 +880,23 @@ async fn agent_steps(
     messages: &mut Vec<Message>,
     tools: &[crate::model_backend::ToolSpec],
     mcp: Option<&McpClient>,
-) -> anyhow::Result<String> {
+    auto_approve: &[String],
+    server_name: &str,
+) -> anyhow::Result<LoopOutcome> {
+    // Возобновление после «да»: подтверждённый вызов исполняется ДО того, как
+    // модель спросят снова. Иначе она увидела бы собственный запрос без
+    // результата и либо повторила бы его, либо получила бы отвергнутую
+    // провайдером историю.
+    if let Some(call) = approved_pending_call(&task_store.get(task_id).await?.map(|t| t.context).unwrap_or_default()) {
+        let Some(client) = mcp else {
+            anyhow::bail!("вызов подтверждён, но MCP-сервер недоступен");
+        };
+        // Единственный путь человека к `ApprovedToolCall`.
+        let approved = crate::tool_gate::approve_by_human(call);
+        let result = execute_tool(task_store, task_id, client, &approved, 0).await;
+        messages.push(Message::tool_result(approved.call().id.clone(), result));
+    }
+
     for step in 1..=MAX_TOOL_ITERATIONS {
         // История копируется, а не отдаётся: следующий шаг должен видеть всё
         // накопленное, включая собственные вызовы инструментов и их
@@ -832,7 +911,7 @@ async fn agent_steps(
         };
 
         match session.generate(request).await? {
-            GenerateResponse::Text(text) => return Ok(text),
+            GenerateResponse::Text(text) => return Ok(LoopOutcome::Answer(text)),
             GenerateResponse::ToolCalls(calls) => {
                 let Some(client) = mcp else {
                     anyhow::bail!(
@@ -844,10 +923,31 @@ async fn agent_steps(
                 // результатами: схема требует, чтобы у каждого сообщения роли
                 // `tool` был предшествующий запрос с тем же идентификатором.
                 messages.push(Message::assistant_tool_calls(calls.clone()));
+                // И в СОХРАНЁННЫЙ контекст тоже: задача может встать на
+                // паузу ради подтверждения и продолжиться в другом процессе,
+                // а история для модели восстанавливается из хранилища.
+                for call in &calls {
+                    record_tool_request(task_store, task_id, call).await;
+                }
 
                 for call in calls {
-                    let result = execute_tool(task_store, task_id, client, &call, step).await;
-                    messages.push(Message::tool_result(call.id, result));
+                    match crate::tool_gate::decide(auto_approve, call) {
+                        crate::tool_gate::Decision::Approved(approved) => {
+                            let result =
+                                execute_tool(task_store, task_id, client, &approved, step).await;
+                            messages.push(Message::tool_result(
+                                approved.call().id.clone(),
+                                result,
+                            ));
+                        }
+                        // Разрешения нет — исполнять нечего и нечем: сырой
+                        // вызов в точку исполнения не подходит по типу.
+                        // Задача встаёт на паузу и ждёт человека.
+                        crate::tool_gate::Decision::NeedsHuman(call) => {
+                            park_for_approval(task_store, task_id, server_name, &call).await?;
+                            return Ok(LoopOutcome::AwaitingHuman);
+                        }
+                    }
                 }
             }
         }
@@ -860,6 +960,125 @@ async fn agent_steps(
     )
 }
 
+/// Разбирает содержимое записи роли `tool_request` обратно в имя и аргументы.
+fn parse_tool_request(content: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let name = value.get("name")?.as_str()?.to_string();
+    let arguments = value.get("arguments")?.as_str()?.to_string();
+    Some((name, arguments))
+}
+
+/// Последний запрос вызова, ожидающий решения человека.
+///
+/// Ищется с конца: если задача успела попросить подтверждения несколько раз,
+/// решается последний. Считается ожидающим, только если ПОСЛЕ него нет
+/// записи роли `tool` с тем же идентификатором — то есть на него ещё не
+/// ответили ни исполнением, ни отказом.
+fn pending_tool_request(context: &[ContextEntry]) -> Option<crate::model_backend::ToolCall> {
+    let request = context
+        .iter()
+        .rev()
+        .find(|e| e.role == TOOL_REQUEST_ROLE)?;
+    let id = request.tool_call_id.clone()?;
+    let already_answered = context
+        .iter()
+        .any(|e| e.role == TOOL_ROLE && e.tool_call_id.as_deref() == Some(id.as_str()));
+    if already_answered {
+        return None;
+    }
+    let (name, arguments) = parse_tool_request(&request.content)?;
+    Some(crate::model_backend::ToolCall {
+        id,
+        name,
+        arguments,
+    })
+}
+
+/// Вызов, который человек подтвердил, но который ещё не исполнен.
+///
+/// Ищется по трём условиям сразу: есть запрос, есть отметка подтверждения с
+/// тем же идентификатором, и НЕТ результата с тем же идентификатором. Третье
+/// условие существенно — без него возобновлённая задача исполняла бы один и
+/// тот же подтверждённый вызов на каждом круге.
+fn approved_pending_call(context: &[ContextEntry]) -> Option<crate::model_backend::ToolCall> {
+    let call = pending_tool_request(context)?;
+    let approved = context
+        .iter()
+        .any(|e| e.role == TOOL_APPROVAL_ROLE && e.tool_call_id.as_deref() == Some(call.id.as_str()));
+    if approved {
+        Some(call)
+    } else {
+        None
+    }
+}
+
+/// Чем закончился проход цикла.
+pub enum LoopOutcome {
+    /// Модель ответила текстом — задача завершена.
+    Answer(String),
+    /// Цикл остановлен: нужен ответ человека на вызов инструмента.
+    /// Задача уже переведена в `WaitingForHuman`, статус трогать не надо.
+    AwaitingHuman,
+}
+
+/// Сохраняет в контекст задачи ЗАПРОС модели на вызов инструмента.
+///
+/// Нужен не для человека, а для продолжения: задача может встать на паузу и
+/// возобновиться отдельным запросом, а история для модели восстанавливается
+/// из хранилища. Без этой записи результат роли `tool` оказался бы ответом
+/// на вызов, которого в истории нет, и провайдер отверг бы её целиком.
+async fn record_tool_request(
+    task_store: &Arc<TaskStore>,
+    task_id: Uuid,
+    call: &crate::model_backend::ToolCall,
+) {
+    let payload = serde_json::json!({ "name": call.name, "arguments": call.arguments });
+    if let Err(err) = task_store
+        .append_context(
+            task_id,
+            ContextEntry {
+                role: TOOL_REQUEST_ROLE.to_string(),
+                content: payload.to_string(),
+                at: Utc::now(),
+                tool_call_id: Some(call.id.clone()),
+            },
+        )
+        .await
+    {
+        tracing::error!("не удалось сохранить запрос вызова {task_id}: {err:#}");
+    }
+}
+
+/// Ставит задачу на паузу до решения человека.
+///
+/// Аргументы вызова уходят в контекст ЦЕЛИКОМ — этого требует спецификация
+/// MCP («показать пользователю аргументы до отправки»), и обрезать их значило
+/// бы просить решение по неполным данным.
+async fn park_for_approval(
+    task_store: &Arc<TaskStore>,
+    task_id: Uuid,
+    server_name: &str,
+    call: &crate::model_backend::ToolCall,
+) -> anyhow::Result<()> {
+    note(
+        task_store,
+        task_id,
+        crate::tool_gate::describe(server_name, call),
+    )
+    .await;
+
+    tracing::info!(
+        "задача {task_id}: вызов '{}' ждёт решения человека ({} символов аргументов)",
+        call.name,
+        call.arguments.chars().count()
+    );
+
+    task_store
+        .set_status(task_id, TaskStatus::WaitingForHuman)
+        .await?;
+    Ok(())
+}
+
 /// Исполняет один вызов инструмента и возвращает текст для модели.
 ///
 /// Ошибка НЕ возвращается наружу: неудачный инструмент — это результат,
@@ -867,22 +1086,26 @@ async fn agent_steps(
 /// Модель, получившая «инструмент отказал», обычно пробует иначе; задача,
 /// упавшая на первом отказе, не пробует ничего.
 ///
-/// Всё, что здесь происходит, записывается в контекст задачи. Инструменты
-/// исполняются без подтверждения человеком (см. долги), и единственное, что
-/// делает их действия обозримыми, — этот след.
+/// Принимает ТОЛЬКО [`ApprovedToolCall`], и это единственная точка
+/// исполнения. Сырой `ToolCall` сюда не подходит по типу, а собрать
+/// `ApprovedToolCall` вне `tool_gate` невозможно — поля приватны. Именно так
+/// гарантия держится типом, а не памятью того, кто добавит следующий путь.
 async fn execute_tool(
     task_store: &Arc<TaskStore>,
     task_id: Uuid,
     client: &McpClient,
-    call: &crate::model_backend::ToolCall,
+    approved: &crate::tool_gate::ApprovedToolCall,
     step: usize,
 ) -> String {
+    let call = approved.call();
     note(
         task_store,
         task_id,
         format!(
-            "шаг {step}: модель вызывает инструмент '{}' с аргументами {}",
-            call.name, call.arguments
+            "шаг {step}: вызываю '{}' (разрешено: {}) с аргументами {}",
+            call.name,
+            approved.approved_by().as_str(),
+            call.arguments
         ),
     )
     .await;
@@ -908,10 +1131,36 @@ async fn execute_tool(
     };
 
     let started = std::time::Instant::now();
-    let result = match client.call_tool(&call.name, arguments).await {
-        Ok(text) => text,
-        Err(err) => format!("ОШИБКА ИНСТРУМЕНТА: {err:#}"),
+    let (result, outcome) = match client.call_tool(&call.name, arguments).await {
+        Ok(text) => {
+            let failed = text.starts_with("ОШИБКА ИНСТРУМЕНТА");
+            let outcome = if failed {
+                crate::tool_gate::Outcome::Failed
+            } else {
+                crate::tool_gate::Outcome::Executed
+            };
+            (text, outcome)
+        }
+        Err(err) => (
+            format!("ОШИБКА ИНСТРУМЕНТА: {err:#}"),
+            crate::tool_gate::Outcome::Failed,
+        ),
     };
+
+    // Журнал пишется ДО записи в контекст: контекст можно перечитать и
+    // истолковать, а журнал отвечает на вопрос «что система реально
+    // сделала», и потерять его строку хуже, чем потерять заметку.
+    if let Err(err) = crate::tool_gate::append_audit(
+        crate::tool_gate::AUDIT_LOG_PATH,
+        &task_id.to_string(),
+        client.server_name(),
+        call,
+        Some(approved.approved_by()),
+        outcome,
+        &result,
+    ) {
+        tracing::error!("не удалось записать вызов в аудит: {err:#}");
+    }
 
     // Результат сохраняется ролью `tool` вместе с идентификатором вызова —
     // это то, ради чего в схеме Task Store появилась колонка.
@@ -965,7 +1214,15 @@ async fn run_task_pipeline(
 
     let started = std::time::Instant::now();
     match run_agent_loop(&task_store, &scheduler, task_id, &category, allow_manual, messages).await {
-        Ok(response) => {
+        // Задача встала на паузу ради решения человека. Статус уже
+        // `WaitingForHuman`, и трогать его нельзя: это не завершение.
+        Ok(LoopOutcome::AwaitingHuman) => {
+            tracing::info!(
+                "задача {task_id} ждёт решения человека по вызову инструмента ({:.1} с работы)",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(LoopOutcome::Answer(response)) => {
             // Длина ответа, а не ответ: размер полезен для диагностики,
             // содержимое в лог не идёт.
             tracing::info!(
@@ -1092,6 +1349,125 @@ async fn pause_task(
         return Err(ApiError::NotFound);
     }
     state.task_store.set_status(id, TaskStatus::Paused).await?;
+    Ok(StatusCode::OK)
+}
+
+/// Решение человека по конкретному вызову инструмента.
+#[derive(Deserialize)]
+struct ToolDecisionRequest {
+    /// `true` — исполнить, `false` — отказать. Поле обязательное намеренно:
+    /// «да» и «нет» — разные решения, и умолчания у них быть не может.
+    approve: bool,
+}
+
+/// Отдельный маршрут, а не признак в `continue`, и это не вкусовщина.
+///
+/// `continue` означает «продолжай работу» и ничего не говорит о КОНКРЕТНОМ
+/// вызове: клиент, отправивший его, не подтверждает ничего — он просто
+/// возобновляет задачу. Если навесить подтверждение на него, то любой
+/// «продолжить» из интерфейса стал бы молчаливым «да» на висящий вызов
+/// произвольного кода. Разрешение обязано быть отдельным, явным действием,
+/// адресованным именно этому вызову.
+///
+/// Идемпотентности здесь нет и не нужно: решать нечего, если ожидающего
+/// вызова нет — тогда 404, а не молчаливое «ок».
+async fn tool_decision(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ToolDecisionRequest>,
+) -> Result<StatusCode, ApiError> {
+    let task = state
+        .task_store
+        .get(id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let Some(call) = pending_tool_request(&task.context) else {
+        return Err(ApiError::BadRequest(
+            "у задачи нет вызова инструмента, ожидающего решения".to_string(),
+        ));
+    };
+
+    if body.approve {
+        // Единственный путь, которым человек создаёт `ApprovedToolCall`.
+        // Исполнение идёт не здесь, а в возобновлённом пайплайне: здесь
+        // некому держать `GenerationGuard`, а исполнять инструмент вне
+        // сессии значило бы дать вытеснить модель под задачей.
+        if let Err(err) = state
+            .task_store
+            .append_context(
+                id,
+                ContextEntry {
+                    role: TOOL_APPROVAL_ROLE.to_string(),
+                    content: format!("человек подтвердил вызов '{}'", call.name),
+                    at: Utc::now(),
+                    tool_call_id: Some(call.id.clone()),
+                },
+            )
+            .await
+        {
+            tracing::error!("не удалось записать подтверждение по задаче {id}: {err:#}");
+        }
+        tracing::info!("задача {id}: человек подтвердил вызов '{}'", call.name);
+    } else {
+        // Отказ становится результатом вызова — сообщением роли `tool`.
+        // Модель обязана узнать об отказе: иначе она либо повторит тот же
+        // вызов, либо соврёт, что выполнила. Пусть лучше попробует иначе или
+        // честно скажет, что не может.
+        let refusal = format!(
+            "ОТКАЗАНО ЧЕЛОВЕКОМ: вызов '{}' не был исполнен. \
+             Не повторяй его; предложи другой способ или объясни, \
+             почему задача невыполнима без него.",
+            call.name
+        );
+        if let Err(err) = state
+            .task_store
+            .append_context(
+                id,
+                ContextEntry {
+                    role: TOOL_ROLE.to_string(),
+                    content: refusal,
+                    at: Utc::now(),
+                    tool_call_id: Some(call.id.clone()),
+                },
+            )
+            .await
+        {
+            tracing::error!("не удалось записать отказ по задаче {id}: {err:#}");
+        }
+
+        if let Err(err) = crate::tool_gate::append_audit(
+            crate::tool_gate::AUDIT_LOG_PATH,
+            &id.to_string(),
+            "-",
+            &call,
+            None,
+            crate::tool_gate::Outcome::DeniedByHuman,
+            "отказ человека",
+        ) {
+            tracing::error!("не удалось записать отказ в аудит: {err:#}");
+        }
+        tracing::info!("задача {id}: человек ОТКАЗАЛ в вызове '{}'", call.name);
+    }
+
+    // Задача возобновляется в обоих случаях: при «да» — чтобы исполнить, при
+    // «нет» — чтобы модель увидела отказ и ответила по-человечески.
+    state.task_store.set_status(id, TaskStatus::Running).await?;
+    let refreshed = state
+        .task_store
+        .get(id)
+        .await?
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("задача исчезла во время решения")))?;
+
+    tokio::spawn(run_task_pipeline(
+        state.task_store.clone(),
+        state.scheduler.clone(),
+        id,
+        refreshed.category.clone(),
+        context_to_messages(&refreshed.context),
+        false,
+    ));
+
     Ok(StatusCode::OK)
 }
 
@@ -1657,6 +2033,165 @@ mod tests {
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Отказ человека обязан дойти до модели сообщением роли `tool`.
+    ///
+    /// Иначе она либо повторит тот же вызов, либо соврёт, что выполнила его.
+    #[tokio::test]
+    async fn a_refusal_reaches_the_model_as_a_tool_result() {
+        let (state, _seen, dir) = looping_fixture();
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        // Задача в состоянии «ждём решения по вызову»: есть запрос и нет
+        // ответа на него.
+        state
+            .task_store
+            .append_context(
+                task.id,
+                ContextEntry {
+                    role: TOOL_REQUEST_ROLE.to_string(),
+                    content: serde_json::json!({
+                        "name": "execute_blender_code",
+                        "arguments": "{\"code\":\"import os\"}"
+                    })
+                    .to_string(),
+                    at: Utc::now(),
+                    tool_call_id: Some("call_9".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .task_store
+            .set_status(task.id, TaskStatus::WaitingForHuman)
+            .await
+            .unwrap();
+
+        let found = pending_tool_request(&state.task_store.get(task.id).await.unwrap().unwrap().context)
+            .expect("ожидающий вызов найден");
+        assert_eq!(found.name, "execute_blender_code");
+
+        // Человек отказывает.
+        let code = tool_decision(
+            State(state.clone()),
+            Path(task.id),
+            Json(ToolDecisionRequest { approve: false }),
+        )
+        .await;
+        assert!(code.is_ok(), "маршрут решения обязан принять отказ");
+
+        let context = state.task_store.get(task.id).await.unwrap().unwrap().context;
+        let refusal = context
+            .iter()
+            .find(|e| e.role == TOOL_ROLE && e.tool_call_id.as_deref() == Some("call_9"))
+            .expect("отказ обязан лечь ролью tool с тем же tool_call_id");
+        assert!(
+            refusal.content.contains("ОТКАЗАНО ЧЕЛОВЕКОМ"),
+            "модель не поймёт, что это отказ: {}", refusal.content
+        );
+        // После ответа вызов перестаёт быть ожидающим — иначе повторное
+        // решение исполнило бы его ещё раз.
+        assert!(pending_tool_request(&context).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Подтверждённый вызов помечается так, что возобновлённый пайплайн
+    /// исполнит его — и ровно один раз.
+    #[tokio::test]
+    async fn an_approval_is_recorded_and_consumed_once() {
+        let (state, _seen, dir) = looping_fixture();
+        let task = state.task_store.create("Simple").await.unwrap();
+        state
+            .task_store
+            .append_context(
+                task.id,
+                ContextEntry {
+                    role: TOOL_REQUEST_ROLE.to_string(),
+                    content: serde_json::json!({"name":"get_scene_info","arguments":"{}"})
+                        .to_string(),
+                    at: Utc::now(),
+                    tool_call_id: Some("call_5".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ctx = state.task_store.get(task.id).await.unwrap().unwrap().context;
+        // До решения человека — не подтверждён.
+        assert!(approved_pending_call(&ctx).is_none());
+
+        state
+            .task_store
+            .append_context(
+                task.id,
+                ContextEntry {
+                    role: TOOL_APPROVAL_ROLE.to_string(),
+                    content: "человек подтвердил".to_string(),
+                    at: Utc::now(),
+                    tool_call_id: Some("call_5".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let ctx = state.task_store.get(task.id).await.unwrap().unwrap().context;
+        assert!(approved_pending_call(&ctx).is_some(), "подтверждение не увидено");
+
+        // После исполнения (результат роли tool) — больше не ожидает.
+        state
+            .task_store
+            .append_context(
+                task.id,
+                ContextEntry {
+                    role: TOOL_ROLE.to_string(),
+                    content: "{}".to_string(),
+                    at: Utc::now(),
+                    tool_call_id: Some("call_5".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let ctx = state.task_store.get(task.id).await.unwrap().unwrap().context;
+        assert!(
+            approved_pending_call(&ctx).is_none(),
+            "подтверждённый вызов исполнился бы на каждом круге"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Запрос вызова, переживший паузу, восстанавливается в реплику
+    /// ассистента с `tool_calls` — без неё провайдер отвергнет историю.
+    #[test]
+    fn a_parked_tool_request_rebuilds_into_an_assistant_message() {
+        let context = vec![
+            ContextEntry {
+                role: "user".to_string(),
+                content: "сделай".to_string(),
+                at: Utc::now(),
+                tool_call_id: None,
+            },
+            ContextEntry {
+                role: TOOL_REQUEST_ROLE.to_string(),
+                content: serde_json::json!({"name":"get_scene_info","arguments":"{}"}).to_string(),
+                at: Utc::now(),
+                tool_call_id: Some("call_3".to_string()),
+            },
+            ContextEntry {
+                role: TOOL_ROLE.to_string(),
+                content: "результат".to_string(),
+                at: Utc::now(),
+                tool_call_id: Some("call_3".to_string()),
+            },
+        ];
+
+        let messages = context_to_messages(&context);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].tool_calls.len(), 1, "запрос вызова не восстановлен");
+        assert_eq!(messages[1].tool_calls[0].id, "call_3");
+        assert_eq!(messages[1].tool_calls[0].name, "get_scene_info");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_3"));
     }
 
     #[test]

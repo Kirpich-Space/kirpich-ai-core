@@ -18,6 +18,7 @@ mod router;
 mod scheduler;
 mod task_store;
 mod telegram_bridge;
+mod tool_gate;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

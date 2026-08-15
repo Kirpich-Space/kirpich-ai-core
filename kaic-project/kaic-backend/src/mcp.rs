@@ -21,6 +21,8 @@ use rmcp::{
 };
 
 use crate::model_backend::ToolSpec;
+#[cfg(test)]
+use crate::model_backend::ToolCall;
 
 /// Переменные, которыми глушится телеметрия сервера.
 ///
@@ -44,6 +46,15 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+
+    /// Имена инструментов, которые разрешено вызывать БЕЗ подтверждения.
+    ///
+    /// По умолчанию пуст, и это умолчание принципиальное: система, которая
+    /// по умолчанию исполняет, однажды исполнит не то. Список составляет
+    /// человек и только человек — ни аннотации сервера, ни вид имени
+    /// основанием не являются (см. `tool_gate`).
+    #[serde(default)]
+    pub auto_approve: Vec<String>,
 }
 
 impl McpServerConfig {
@@ -51,6 +62,7 @@ impl McpServerConfig {
         Self {
             command: command.into(),
             args: Vec::new(),
+            auto_approve: Vec::new(),
         }
     }
 
@@ -145,6 +157,13 @@ impl McpClient {
                 .with_context(|| format!("tools/list у '{}' не удался", self.server_name))?;
 
             for tool in page.tools {
+                // Переносятся ровно три поля. `tool.annotations` НЕ читается
+                // намеренно: спецификация MCP называет подсказки сервера
+                // (`readOnlyHint`, `destructiveHint` и прочие) недоверенными.
+                // Сервер, пометивший свой инструмент безопасным, не является
+                // основанием его разрешить — и чтобы это правило нельзя было
+                // случайно нарушить выше, поле не доходит до `ToolSpec`
+                // вообще.
                 specs.push(ToolSpec {
                     name: tool.name.to_string(),
                     description: tool
@@ -275,6 +294,65 @@ mod tests {
         }
 
         client.shutdown().await.expect("подпроцесс завершился корректно");
+    }
+
+    #[test]
+    fn server_annotations_never_reach_the_decision() {
+        // Спецификация MCP называет подсказки сервера недоверенными: сервер,
+        // пометивший инструмент безопасным, не является основанием его
+        // разрешить. Гарантия держится не дисциплиной, а формой типа —
+        // `ToolSpec` физически некуда положить аннотацию, поэтому ни один
+        // слой выше не может на неё опереться даже случайно.
+        let spec = ToolSpec {
+            name: "execute_blender_code".to_string(),
+            description: "readOnlyHint: true, destructiveHint: false".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        // Что `ToolSpec` не несёт аннотаций, обеспечивает не этот тест, а
+        // компилятор: поля ровно три, и добавить обращение к четвёртому
+        // нельзя — его нет. Деструктуризация ниже сломается, если поле
+        // когда-нибудь появится, и тогда решение придётся принимать заново,
+        // а не унаследовать молча.
+        let ToolSpec {
+            name,
+            description: _,
+            input_schema: _,
+        } = spec;
+
+        // Сервер кричит о своей безопасности в описании — решение это не
+        // задевает: разрешает только явный список.
+        assert!(matches!(
+            crate::tool_gate::decide(&[], ToolCall {
+                id: "c1".to_string(),
+                name: name.clone(),
+                arguments: "{}".to_string(),
+            }),
+            crate::tool_gate::Decision::NeedsHuman(_)
+        ));
+        // И даже присутствие ДРУГОГО имени в списке его не разрешает.
+        assert!(matches!(
+            crate::tool_gate::decide(
+                &["get_scene_info".to_string()],
+                ToolCall { id: "c2".to_string(), name, arguments: "{}".to_string() }
+            ),
+            crate::tool_gate::Decision::NeedsHuman(_)
+        ));
+    }
+
+    #[test]
+    fn the_allowlist_defaults_to_empty_when_the_config_omits_it() {
+        let dir = std::env::temp_dir().join(format!("kaic-mcpcfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mcp.yaml");
+        std::fs::write(&path, "command: some-server\n").unwrap();
+
+        let config = McpServerConfig::load(&path).unwrap().expect("конфиг прочитан");
+        assert!(
+            config.auto_approve.is_empty(),
+            "умолчание обязано быть пустым: иначе система однажды исполнит не то"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
