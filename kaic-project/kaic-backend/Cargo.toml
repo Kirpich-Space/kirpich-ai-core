@@ -74,6 +74,24 @@ anyhow = "1"
 # поэтому обычный `cargo build` не требует CUDA Toolkit, как и раньше.
 llama-cpp-4 = { version = "0.4.2", optional = true }
 encoding_rs = { version = "0.8", optional = true }
+# MCP-клиент — официальный SDK. Вариант выбран архитектором после разведки:
+# rmcp + транспорт stdio + локальные модели.
+#
+# `default-features = false` не косметика. Умолчание тянет `server`, `macros`,
+# `schemars`, `base64`, `uuid` и `transport-async-rw` — всё это нужно тому, кто
+# ПИШЕТ сервер, а мы только ходим клиентом к чужому. Из транспортов взят
+# единственный: `transport-child-process` (запуск сервера подпроцессом по
+# stdio). Ни Streamable HTTP, ни SSE, ни reqwest-ветка SDK не подключены.
+#
+# Цена замерена, а не предположена: +8 крейтов в Cargo.lock (308 → 316).
+# Из них 5 — семейство `windows`, которое `process-wrap` использует для
+# управления жизнью подпроцесса; `nix` — то же самое под Unix; плюс сам
+# `rmcp` и `process-wrap`. Ни tokio, ни tower, ни serde новыми не пришли —
+# они уже были в дереве через axum. Порог остановки был 40 крейтов.
+rmcp = { version = "3.1.2", default-features = false, features = [
+    "client",
+    "transport-child-process",
+] }
 
 [features]
 # CPU-инференс через встроенный llama.cpp, без внешнего LM Studio.
