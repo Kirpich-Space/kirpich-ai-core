@@ -1362,14 +1362,21 @@ async fn run_task_pipeline_inner(
 
     let mut messages = messages;
     for followup in 0..=MAX_HUMAN_FOLLOWUPS {
-    // Длина контекста ДО обращения к модели. По ней потом видно, дописал ли
-    // человек реплику, пока задача считалась.
-    let context_before = task_store
+    // Сколько реплик ЧЕЛОВЕКА в контексте до обращения к модели.
+    //
+    // Считаются только записи роли `user`, а не длина контекста целиком, и это
+    // не придирка: пайплайн пишет в контекст сам — `note()` кладёт список
+    // инструментов, `record_tool_request()` кладёт запрос вызова, отказ кладёт
+    // сообщение роли `tool`. По длине «контекст вырос» выполнялось на любой
+    // задаче с инструментами без всякого участия человека, и цикл
+    // перезапускался до предела, затирая настоящий ответ пустым. Найдено
+    // живым прогоном, а не модульным тестом.
+    let user_turns_before = task_store
         .get(task_id)
         .await
         .ok()
         .flatten()
-        .map(|t| t.context.len())
+        .map(|t| t.context.iter().filter(|e| e.role == "user").count())
         .unwrap_or(0);
 
     let started = std::time::Instant::now();
@@ -1415,20 +1422,20 @@ async fn run_task_pipeline_inner(
             // был обратным, и ответ ложился ролью `assistant` независимо ни
             // от чего — то есть отменённая задача получала полноценный
             // ответ, который Telegram-мост потом и отправлял.
-            let context_after = task_store
+            let user_turns_after = task_store
                 .get(task_id)
                 .await
                 .ok()
                 .flatten()
-                .map(|t| t.context.len())
-                .unwrap_or(context_before);
+                .map(|t| t.context.iter().filter(|e| e.role == "user").count())
+                .unwrap_or(user_turns_before);
 
             // Пришла ли реплика человека, пока шла генерация? Если да —
             // задача НЕ закрывается: ответ ложится в контекст, реплика
             // подхватывается, и следующий шаг делает ТА ЖЕ задача, тем же
             // пайплайном, последовательно. Второй генерации не заводится —
             // ровно это и было дефектом: `running_tasks` уходил с 1 на 2.
-            if context_after > context_before && followup < MAX_HUMAN_FOLLOWUPS {
+            if user_turns_after > user_turns_before && followup < MAX_HUMAN_FOLLOWUPS {
                 let appended = task_store
                     .append_context(
                         task_id,
@@ -2202,6 +2209,66 @@ mod tests {
             after_cancel < std::time::Duration::from_millis(300),
             "после отмены пайплайн жил ещё {:?} — то есть досидел генерацию,              а не прекратил её. Осталось генерации было ~650 мс",
             after_cancel
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// РЕГРЕССИЯ, НАЙДЕННАЯ ЖИВЫМ ПРОГОНОМ (не модульным тестом).
+    ///
+    /// Подхват реплики человека я в прошлом заходе определял как «контекст
+    /// вырос за время генерации». Это неверно: пайплайн пишет в контекст САМ —
+    /// `note()` кладёт список инструментов, `record_tool_request()` кладёт
+    /// запрос вызова. То есть на любой задаче с инструментами условие
+    /// выполнялось без всякой реплики человека, цикл перезапускался до предела
+    /// `MAX_HUMAN_FOLLOWUPS`, и последний пустой ответ ЗАТИРАЛ настоящий.
+    ///
+    /// Живой прогон это и показал: задача ответила по делу на 7-й записи, а
+    /// закрылась пустым ответом на 13-й. Модульные тесты прошлого захода этого
+    /// не видели, потому что без `config/mcp.yaml` пайплайн ничего сам не
+    /// пишет.
+    ///
+    /// Различать надо не рост контекста, а появление записей роли `user`.
+    #[tokio::test]
+    async fn context_grown_by_the_pipeline_itself_is_not_a_human_reply() {
+        let (state, counters, dir) = counting_fixture(600);
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        let pipeline = tokio::spawn(run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            state.control.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        ));
+
+        // Пайплайн так и пишет о себе сам: роль `system`, не `user`.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        state
+            .task_store
+            .append_context(
+                task.id,
+                ContextEntry {
+                    role: "system".to_string(),
+                    content: "инструменты от 'BlenderMCP': get_scene_info, …".to_string(),
+                    at: Utc::now(),
+                    tool_call_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        pipeline.await.expect("пайплайн не паниковал");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(
+            counters.calls.load(SeqCst),
+            1,
+            "рост контекста записью самого пайплайна принят за реплику человека:              цикл перезапустился {} раз вместо одного",
+            counters.calls.load(SeqCst)
         );
 
         std::fs::remove_dir_all(&dir).ok();
