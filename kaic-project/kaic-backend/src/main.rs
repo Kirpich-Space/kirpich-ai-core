@@ -6,6 +6,7 @@
 //! напрямую из control_center_api.rs.
 
 mod capability_registry;
+mod control_auth;
 mod control_center_api;
 #[cfg(feature = "embedded-backend")]
 mod embedded_backend;
@@ -80,6 +81,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Секрет Control Center читается ПЕРВЫМ делом — до Resource Registry,
+    // до выгрузки моделей и до любого касания GPU. Отсутствие секрета это
+    // отказ конфигурации, а не отказ во время работы: узнать о нём надо за
+    // миллисекунды, а не после минуты загрузки модели.
+    let control_token = control_auth::ControlToken::from_env()?;
+
     let capability_registry = Arc::new(CapabilityRegistry::from_file(
         "config/capability_registry.yaml",
     )?);
@@ -116,6 +123,7 @@ async fn main() -> Result<()> {
         task_store,
         scheduler,
         resource_registry,
+        control: control_center_api::TaskControl::default(),
     };
 
     // Telegram Bridge — такой же HTTP-клиент Control Center API, как Electron.
@@ -126,7 +134,7 @@ async fn main() -> Result<()> {
     telegram_bridge::spawn_if_configured(telegram_config).await;
 
     let addr: SocketAddr = "127.0.0.1:4545".parse()?;
-    let result = serve(state, addr).await;
+    let result = serve(state, addr, control_token).await;
 
     // Дополнение к стартовой чистке, не замена ей: срабатывает только при
     // корректном завершении (Ctrl+C через graceful_shutdown). При kill или

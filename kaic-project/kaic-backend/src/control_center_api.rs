@@ -26,7 +26,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, AllowMethods, CorsLayer};
 use uuid::Uuid;
 
 use crate::media::credits::{plan_render, RenderPlan};
@@ -51,10 +51,106 @@ pub struct AppState {
     pub task_store: Arc<TaskStore>,
     pub scheduler: Arc<Scheduler>,
     pub resource_registry: Arc<ResourceRegistry>,
+    pub control: TaskControl,
 }
 
+/// Связь между обработчиком маршрута и ИДУЩИМ пайплайном задачи.
+///
+/// Зачем это понадобилось. До этой правки `POST /tasks/:id/cancel` писал
+/// `TaskStatus::Cancelled` в хранилище и возвращал 200 — и всё. Слово
+/// `Cancelled` не читалось нигде: ни `run_task_pipeline`, ни `agent_steps`
+/// в хранилище за ним не ходили. Сигнал терялся на первом же шаге, а
+/// генерация досиживала до естественного конца. Измерено АРХИВ-105:
+/// 46.141 с без отмены против 46.266 с с отменой — разница ноль.
+///
+/// Реестр в SQLite для этого не годится в принципе: он умеет хранить, но не
+/// умеет БУДИТЬ. Нужен канал, по которому идущая задача узнаёт об отмене, не
+/// опрашивая базу. `watch` выбран вместо `Notify` намеренно: он хранит
+/// значение, поэтому отмена, пришедшая между двумя точками ожидания, не
+/// теряется — поздний читатель всё равно увидит `true`.
+#[derive(Clone, Default)]
+pub struct TaskControl {
+    running: Arc<tokio::sync::Mutex<HashMap<Uuid, tokio::sync::watch::Sender<bool>>>>,
+}
+
+impl TaskControl {
+    /// Отмечает задачу идущей и отдаёт приёмник сигнала отмены.
+    pub async fn register(&self, id: Uuid) -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        self.running.lock().await.insert(id, tx);
+        rx
+    }
+
+    /// Снимает отметку. Вызывается на ЛЮБОМ исходе пайплайна, иначе
+    /// завершившаяся задача навсегда осталась бы «идущей», и второй
+    /// `continue` по ней уже никогда бы не запустился.
+    pub async fn unregister(&self, id: Uuid) {
+        self.running.lock().await.remove(&id);
+    }
+
+    /// Просит идущую задачу прекратить работу.
+    ///
+    /// Возвращает `true`, если было кого просить. `false` означает, что
+    /// задача уже не идёт — и это не ошибка, а другой случай.
+    pub async fn cancel(&self, id: Uuid) -> bool {
+        match self.running.lock().await.get(&id) {
+            Some(tx) => {
+                let _ = tx.send(true);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Идёт ли сейчас пайплайн по этой задаче.
+    pub async fn is_running(&self, id: Uuid) -> bool {
+        self.running.lock().await.contains_key(&id)
+    }
+}
+
+/// Origin'ы, которым браузеру разрешено читать ответы Control Center.
+///
+/// Список явный, а не `permissive()`. Разница не косметическая:
+/// `permissive()` отвечает `Access-Control-Allow-Origin: *`, то есть любая
+/// открытая в браузере страница получала право ЧИТАТЬ очередь задач
+/// пользователя. Здесь перечислено ровно то, что действительно есть:
+/// Vite dev-сервер kaic-ui (5173) и сам Control Center (4545), на обеих
+/// формах записи петлевого адреса — браузер считает `localhost` и
+/// `127.0.0.1` разными origin'ами.
+///
+/// Electron в упакованном виде обращается с `file://` и origin не шлёт
+/// вовсе; такие запросы CORS не касается — их пускает или не пускает
+/// аутентификация, и это верное разделение обязанностей.
+const ALLOWED_ORIGINS: [&str; 4] = [
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://127.0.0.1:4545",
+    "http://localhost:4545",
+];
+
 /// Собирает маршруты Control Center API.
-pub fn build_router(state: AppState) -> axum::Router {
+///
+/// [`ControlToken`] — обязательный аргумент, и это главное в сигнатуре.
+/// Роутер без токена невозможно собрать: не потому, что об этом помнят, а
+/// потому, что нечего подставить. Ровно так же `execute_tool` принимает
+/// только `ApprovedToolCall`.
+pub fn build_router(state: AppState, token: crate::control_auth::ControlToken) -> axum::Router {
+    let origins: Vec<axum::http::HeaderValue> = ALLOWED_ORIGINS
+        .iter()
+        .map(|o| o.parse().expect("список origin'ов задан константами и разбирается всегда"))
+        .collect();
+
+    let cors = CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods(AllowMethods::list([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+        ]))
+        .allow_headers(AllowHeaders::list([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ]));
+
     axum::Router::new()
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/:id", get(get_task))
@@ -65,14 +161,25 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/models", get(list_models))
         .route("/models/:name/temperature", post(set_model_temperature))
         .route("/status", get(status))
-        .layer(CorsLayer::permissive())
+        // Порядок слоёв важен. `route_layer` с проверкой токена — ВНУТРИ,
+        // CORS — СНАРУЖИ: браузер шлёт preflight `OPTIONS` без заголовка
+        // `Authorization`, и отвечать на него должен CORS, а не 401.
+        .route_layer(axum::middleware::from_fn_with_state(
+            token,
+            crate::control_auth::require_token,
+        ))
+        .layer(cors)
         .with_state(state)
 }
 
 /// Запускает Control Center API на указанном адресе.
 /// Вызывается один раз из `main.rs`.
-pub async fn serve(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
-    let app = build_router(state);
+pub async fn serve(
+    state: AppState,
+    addr: SocketAddr,
+    token: crate::control_auth::ControlToken,
+) -> anyhow::Result<()> {
+    let app = build_router(state, token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Control Center API слушает на {addr}");
     axum::serve(listener, app)
@@ -177,6 +284,7 @@ async fn create_task(
     tokio::spawn(run_task_pipeline(
         state.task_store.clone(),
         state.scheduler.clone(),
+        state.control.clone(),
         task.id,
         category,
         context_to_messages(&refreshed.context),
@@ -1196,11 +1304,51 @@ async fn execute_tool(
 async fn run_task_pipeline(
     task_store: Arc<TaskStore>,
     scheduler: Arc<Scheduler>,
+    control: TaskControl,
     task_id: Uuid,
     category: String,
     messages: Vec<Message>,
     allow_manual: bool,
 ) {
+    // Задача отмечается идущей ДО первого обращения к модели и снимается на
+    // любом исходе — иначе `cancel` не нашёл бы кого останавливать, а
+    // `continue` считал бы завершённую задачу вечно занятой.
+    let mut cancel_rx = control.register(task_id).await;
+    run_task_pipeline_inner(
+        &task_store,
+        &scheduler,
+        &control,
+        &mut cancel_rx,
+        task_id,
+        category,
+        messages,
+        allow_manual,
+    )
+    .await;
+    control.unregister(task_id).await;
+}
+
+/// Сколько раз подряд задача может подхватить реплику человека, пришедшую
+/// во время работы.
+///
+/// Предел нужен по той же причине, что и `MAX_TOOL_ITERATIONS`: человек,
+/// который шлёт реплики быстрее, чем модель отвечает, не должен получить
+/// незавершимую задачу. Три — это «ответил, уточнили, ответил, уточнили,
+/// ответил»; дальше разговор ведётся новой задачей.
+const MAX_HUMAN_FOLLOWUPS: usize = 3;
+
+#[allow(clippy::too_many_arguments)]
+async fn run_task_pipeline_inner(
+    task_store: &Arc<TaskStore>,
+    scheduler: &Arc<Scheduler>,
+    control: &TaskControl,
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    task_id: Uuid,
+    category: String,
+    messages: Vec<Message>,
+    allow_manual: bool,
+) {
+    let _ = control;
     // Первое и пока единственное ветвление по категории. До этого все
     // категории шли одним путём (текст → модель → текст), и Video ничем не
     // отличалась от Programming, хотя существовала в Router'е.
@@ -1208,12 +1356,42 @@ async fn run_task_pipeline(
     // Video не обращается к модели вообще: медиа-пайплайн — это поиск в
     // лицензионном источнике, гейт и сборка плана, а не генерация текста.
     if category == Category::Video.as_str() {
-        run_video_pipeline(task_store, scheduler, task_id, &messages).await;
+        run_video_pipeline(task_store.clone(), scheduler.clone(), task_id, &messages).await;
         return;
     }
 
+    let mut messages = messages;
+    for followup in 0..=MAX_HUMAN_FOLLOWUPS {
+    // Длина контекста ДО обращения к модели. По ней потом видно, дописал ли
+    // человек реплику, пока задача считалась.
+    let context_before = task_store
+        .get(task_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| t.context.len())
+        .unwrap_or(0);
+
     let started = std::time::Instant::now();
-    match run_agent_loop(&task_store, &scheduler, task_id, &category, allow_manual, messages).await {
+
+    // Гонка «работа против отмены». Именно здесь чинится долг: раньше
+    // `run_agent_loop` просто ожидался до конца, и слово `Cancelled` в
+    // хранилище никого не касалось. Проигравшее будущее ДРОПАЕТСЯ, а вместе
+    // с ним — и запрос к модели, и `Session`, держащая `GenerationGuard`.
+    // Поэтому после отмены слот модели освобождается сразу, а не после
+    // естественного конца генерации.
+    let loop_result = tokio::select! {
+        _ = wait_for_cancel(cancel_rx) => {
+            tracing::info!(
+                "задача {task_id} остановлена человеком через {:.1} с — генерация прервана",
+                started.elapsed().as_secs_f64()
+            );
+            return;
+        }
+        outcome = run_agent_loop(task_store, scheduler, task_id, &category, allow_manual, messages.clone()) => outcome,
+    };
+
+    match loop_result {
         // Задача встала на паузу ради решения человека. Статус уже
         // `WaitingForHuman`, и трогать его нельзя: это не завершение.
         Ok(LoopOutcome::AwaitingHuman) => {
@@ -1221,6 +1399,7 @@ async fn run_task_pipeline(
                 "задача {task_id} ждёт решения человека по вызову инструмента ({:.1} с работы)",
                 started.elapsed().as_secs_f64()
             );
+            return;
         }
         Ok(LoopOutcome::Answer(response)) => {
             // Длина ответа, а не ответ: размер полезен для диагностики,
@@ -1236,7 +1415,48 @@ async fn run_task_pipeline(
             // был обратным, и ответ ложился ролью `assistant` независимо ни
             // от чего — то есть отменённая задача получала полноценный
             // ответ, который Telegram-мост потом и отправлял.
-            record_outcome(&task_store, task_id, TaskStatus::Done, response).await;
+            let context_after = task_store
+                .get(task_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.context.len())
+                .unwrap_or(context_before);
+
+            // Пришла ли реплика человека, пока шла генерация? Если да —
+            // задача НЕ закрывается: ответ ложится в контекст, реплика
+            // подхватывается, и следующий шаг делает ТА ЖЕ задача, тем же
+            // пайплайном, последовательно. Второй генерации не заводится —
+            // ровно это и было дефектом: `running_tasks` уходил с 1 на 2.
+            if context_after > context_before && followup < MAX_HUMAN_FOLLOWUPS {
+                let appended = task_store
+                    .append_context(
+                        task_id,
+                        ContextEntry {
+                            role: "assistant".to_string(),
+                            content: response,
+                            at: Utc::now(),
+                            tool_call_id: None,
+                        },
+                    )
+                    .await;
+                if let Err(e) = appended {
+                    tracing::error!("не удалось сохранить ответ задачи {task_id}: {e:#}");
+                    return;
+                }
+                let Ok(Some(refreshed)) = task_store.get(task_id).await else {
+                    return;
+                };
+                tracing::info!(
+                    "задача {task_id}: реплика человека пришла во время работы — продолжаю ТУ ЖЕ задачу, шаг {}",
+                    followup + 2
+                );
+                messages = context_to_messages(&refreshed.context);
+                continue;
+            }
+
+            record_outcome(task_store, task_id, TaskStatus::Done, response).await;
+            return;
         }
         Err(err) => {
             tracing::warn!(
@@ -1261,14 +1481,33 @@ async fn run_task_pipeline(
             if let Err(e) = append_result {
                 tracing::error!("не удалось сохранить ошибку для задачи {task_id}: {e:#}");
             }
-            if !claim_finish(&task_store, task_id, TaskStatus::Failed).await {
+            if !claim_finish(task_store, task_id, TaskStatus::Failed).await {
                 tracing::warn!(
                     "задача {task_id}: отказ пришёл после того, как статус сменил человек — \
                      решение человека сохранено"
                 );
             }
+            return;
         }
     }
+    }
+}
+
+/// Ждёт сигнала отмены и только его.
+///
+/// Если отправитель исчез, это НЕ отмена: функция зависает навсегда, и в
+/// `select!` побеждает работа. Иначе снятие задачи с учёта выглядело бы
+/// как отмена и обрывало бы уже завершающуюся генерацию.
+async fn wait_for_cancel(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await
 }
 
 async fn get_task(
@@ -1318,6 +1557,21 @@ async fn continue_task(
     }
 
     state.task_store.set_pending_telegram_message(id, None).await?;
+
+    // Задача уже идёт? Тогда реплика ДОПИСАНА в контекст выше, и этого
+    // достаточно: пайплайн подхватит её сам на ближайшей границе шага и
+    // продолжит ТУ ЖЕ задачу. Второй пайплайн не заводится.
+    //
+    // Раньше здесь безусловно делался `tokio::spawn`, и по одной задаче
+    // начинали считать две генерации сразу — измерено АРХИВ-105:
+    // `running_tasks` 1 -> 2, `busy_models.generations` 1 -> 2.
+    if state.control.is_running(id).await {
+        tracing::info!(
+            "задача {id} уже идёт — реплика дописана в контекст, вторая генерация не заводится"
+        );
+        return Ok(StatusCode::ACCEPTED);
+    }
+
     state.task_store.set_status(id, TaskStatus::Running).await?;
 
     // Перечитываем задачу — контекст уже включает только что добавленную
@@ -1332,6 +1586,7 @@ async fn continue_task(
     tokio::spawn(run_task_pipeline(
         state.task_store.clone(),
         state.scheduler.clone(),
+        state.control.clone(),
         id,
         refreshed.category,
         context_to_messages(&refreshed.context),
@@ -1462,6 +1717,7 @@ async fn tool_decision(
     tokio::spawn(run_task_pipeline(
         state.task_store.clone(),
         state.scheduler.clone(),
+        state.control.clone(),
         id,
         refreshed.category.clone(),
         context_to_messages(&refreshed.context),
@@ -1479,6 +1735,16 @@ async fn cancel_task(
         return Err(ApiError::NotFound);
     }
     state.task_store.set_status(id, TaskStatus::Cancelled).await?;
+
+    // Пометка в хранилище — это ЗАПИСЬ о решении, а не его исполнение.
+    // Раньше здесь всё и заканчивалось: слово `Cancelled` не читал никто,
+    // и генерация досиживала до конца. Теперь идущему пайплайну посылается
+    // сигнал, и он бросает работу на ближайшей точке ожидания.
+    let was_running = state.control.cancel(id).await;
+    tracing::info!(
+        "задача {id} отменена человеком; шла в этот момент: {}",
+        if was_running { "да, сигнал послан" } else { "нет" }
+    );
     Ok(StatusCode::OK)
 }
 
@@ -1785,6 +2051,7 @@ mod tests {
                 task_store,
                 scheduler,
                 resource_registry,
+                control: TaskControl::default(),
             },
             dir,
         )
@@ -1800,6 +2067,199 @@ mod tests {
             .status
     }
 
+    /// Считает обращения к модели. Нужен там, где предмет проверки — СКОЛЬКО
+    /// раз система пошла к модели, а не что она принесла.
+    struct CountingSlowBackend {
+        generate_ms: u64,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Сколько генераций идёт ПРЯМО СЕЙЧАС.
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        /// Максимум, которого одновременность достигала за прогон. Это и
+        /// есть измеренная величина дефекта: АРХИВ-105 видел `running_tasks`
+        /// 1 -> 2 на одной задаче.
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model_backend::ModelBackend for CountingSlowBackend {
+        async fn is_loaded(&self, _model: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn load(&self, _model: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn unload(&self, _model: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn generate(
+            &self,
+            _model: &str,
+            _request: crate::model_backend::GenerateRequest,
+        ) -> anyhow::Result<crate::model_backend::GenerateResponse> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(self.generate_ms)).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            Ok(crate::model_backend::GenerateResponse::Text("ответ модели".to_string()))
+        }
+    }
+
+    /// Что видит фикстура: сколько раз ходили к модели и какой была
+    /// наибольшая одновременность.
+    struct Counters {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn counting_fixture(
+        generate_ms: u64,
+    ) -> (AppState, Counters, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kaic-count-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let resources = dir.join("resource_registry.yaml");
+        std::fs::write(&resources, "Fake:
+  vram_mb: 1000
+  load_seconds: 1
+").unwrap();
+        let capabilities = dir.join("capability_registry.yaml");
+        std::fs::write(&capabilities, "Simple:
+  primary: Fake
+").unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resource_registry = Arc::new(ResourceRegistry::from_file(&resources).unwrap());
+        let scheduler = Arc::new(Scheduler::new(
+            Arc::new(
+                crate::capability_registry::CapabilityRegistry::from_file(&capabilities).unwrap(),
+            ),
+            resource_registry.clone(),
+            Arc::new(CountingSlowBackend {
+                generate_ms,
+                calls: calls.clone(),
+                in_flight: in_flight.clone(),
+                peak: peak.clone(),
+            }),
+            24495,
+        ));
+        let task_store = Arc::new(TaskStore::new(":memory:").unwrap());
+        (
+            AppState {
+                task_store,
+                scheduler,
+                resource_registry,
+                control: TaskControl::default(),
+            },
+            Counters { calls, peak },
+            dir,
+        )
+    }
+
+    /// ДОЛГ 2, ЧАСТЬ 1. Отмена обязана ОСТАНАВЛИВАТЬ работу, а не только
+    /// помечать задачу отменённой.
+    ///
+    /// Измерено АРХИВ-105 на живой системе: `POST /cancel` отвечал 200
+    /// мгновенно, а работа шла ещё 36 секунд — 46.141 с против 46.266 с при
+    /// контроле, то есть разница ноль. Здесь то же самое в миллисекундах.
+    ///
+    /// Что именно упало бы, если правку убрать: пайплайн досиживает всю
+    /// генерацию, и от момента отмены до его завершения проходит почти
+    /// столько же, сколько оставалось генерации.
+    #[tokio::test]
+    async fn cancelling_stops_the_generation_instead_of_waiting_for_it() {
+        let (state, dir) = pipeline_fixture(800);
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        let pipeline = tokio::spawn(run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            state.control.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let cancelled_at = std::time::Instant::now();
+        if cancel_task(State(state.clone()), Path(task.id)).await.is_err() {
+            panic!("обработчик отмены отказал");
+        }
+
+        pipeline.await.expect("пайплайн не паниковал");
+        let after_cancel = cancelled_at.elapsed();
+
+        assert!(
+            after_cancel < std::time::Duration::from_millis(300),
+            "после отмены пайплайн жил ещё {:?} — то есть досидел генерацию,              а не прекратил её. Осталось генерации было ~650 мс",
+            after_cancel
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ДОЛГ 2, ЧАСТЬ 2. Реплика в ИДУЩУЮ задачу не должна заводить вторую
+    /// генерацию.
+    ///
+    /// Измерено АРХИВ-105: `POST /continue` отвечал 200, а `running_tasks`
+    /// уходил с 1 на 2 и `busy_models.generations` с 1 на 2 — то есть модель
+    /// считала одну и ту же задачу дважды.
+    ///
+    /// Что именно упало бы без правки: счётчик обращений к модели равен 2.
+    #[tokio::test]
+    async fn continuing_a_running_task_does_not_start_a_second_generation() {
+        let (state, counters, dir) = counting_fixture(600);
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        let pipeline = tokio::spawn(run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            state.control.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let _ = continue_task(
+            State(state.clone()),
+            Path(task.id),
+            Json(ContinueRequest {
+                message: Some("добавь про мосты".to_string()),
+                allow_manual: None,
+            }),
+        )
+        .await;
+
+        pipeline.await.expect("пайплайн не паниковал");
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(
+            counters.peak.load(SeqCst),
+            1,
+            "по одной задаче одновременно шло {} генераций: реплика завела ВТОРУЮ              параллельную работу вместо того, чтобы войти в текущую задачу.              Это и есть измеренное АРХИВ-105 `running_tasks` 1 -> 2",
+            counters.peak.load(SeqCst)
+        );
+        assert_eq!(
+            counters.calls.load(SeqCst),
+            2,
+            "реплика обязана быть учтена: ожидался ровно один ДОПОЛНИТЕЛЬНЫЙ шаг              той же задачи, последовательно после первого"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Главный дефект: человек отменил, система подтвердила отмену, а
     /// завершившаяся генерация молча вернула задачу в Done.
     ///
@@ -1813,6 +2273,7 @@ mod tests {
         let pipeline = tokio::spawn(run_task_pipeline(
             state.task_store.clone(),
             state.scheduler.clone(),
+            state.control.clone(),
             task.id,
             "Simple".to_string(),
             Vec::new(),
@@ -1842,30 +2303,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Результат, досчитанный после отмены, обязан остаться в задаче — но не
-    /// ответом.
+    /// ЭТОТ ТЕСТ ЗАМЕНИЛ СОБОЙ `work_finished_after_a_cancel_is_kept_but_not_as_the_answer`.
     ///
-    /// Молча выбросить его было бы новым молчаливым отказом. Положить его
-    /// ролью `assistant` — тоже отказ, только хитрее: Telegram-мост берёт
-    /// последнюю запись этой роли и отправляет её человеку, то есть отменённая
-    /// задача всё равно вернула бы ответ.
+    /// Прежний тест закреплял поведение мира, в котором отмена не
+    /// останавливала работу: генерация всё равно досчитывалась, и вопрос
+    /// был лишь в том, куда положить её результат — он требовал, чтобы
+    /// результат остался следом роли `system`, но не стал ответом.
+    ///
+    /// После правки долга 2 такого результата не существует: отмена бросает
+    /// генерацию. Требование «сохрани досчитанное» стало недостижимым не
+    /// потому, что его нарушили, а потому, что досчитывать больше нечего.
+    /// Оставить прежний тест зелёным можно было бы только вернув дефект.
+    ///
+    /// Проверяемое здесь свойство строго сильнее прежнего: у отменённой
+    /// задачи нет ни ответа, ни текста модели вообще.
     #[tokio::test]
-    async fn work_finished_after_a_cancel_is_kept_but_not_as_the_answer() {
-        let (state, dir) = pipeline_fixture(400);
+    async fn a_cancelled_task_has_neither_an_answer_nor_any_model_text() {
+        let (state, dir) = pipeline_fixture(800);
         let task = state.task_store.create("Simple").await.unwrap();
 
         let pipeline = tokio::spawn(run_task_pipeline(
             state.task_store.clone(),
             state.scheduler.clone(),
+            state.control.clone(),
             task.id,
             "Simple".to_string(),
             Vec::new(),
             false,
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let _ = cancel_task(State(state.clone()), Path(task.id)).await;
         pipeline.await.expect("пайплайн не паниковал");
+
+        assert_eq!(
+            status_of(&state, task.id).await,
+            TaskStatus::Cancelled,
+            "отменённая задача обязана остаться отменённой"
+        );
 
         let context = state
             .task_store
@@ -1877,17 +2352,11 @@ mod tests {
 
         assert!(
             context.iter().all(|e| e.role != "assistant"),
-            "результат отменённой задачи лёг ответом — Telegram отправит его человеку"
+            "у отменённой задачи появился ответ — Telegram-мост отправит его человеку"
         );
-        let trace = context
-            .iter()
-            .find(|e| e.content.contains("ответ модели"))
-            .expect("работа, которую сделал GPU, обязана оставить след");
-        assert_eq!(trace.role, "system");
         assert!(
-            trace.content.contains("отменена"),
-            "след не объясняет, почему это не ответ: {}",
-            trace.content
+            context.iter().all(|e| !e.content.contains("ответ модели")),
+            "текст модели попал в контекст отменённой задачи: генерация не была прервана,              а лишь переименована"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1989,6 +2458,7 @@ mod tests {
                 task_store: Arc::new(TaskStore::new(":memory:").unwrap()),
                 scheduler,
                 resource_registry,
+                control: TaskControl::default(),
             },
             seen,
             dir,
@@ -2009,6 +2479,7 @@ mod tests {
         run_task_pipeline(
             state.task_store.clone(),
             state.scheduler.clone(),
+            state.control.clone(),
             task.id,
             "Simple".to_string(),
             vec![Message::new(Role::User, "сделай что-нибудь")],
@@ -2214,6 +2685,7 @@ mod tests {
         run_task_pipeline(
             state.task_store.clone(),
             state.scheduler.clone(),
+            state.control.clone(),
             task.id,
             "Simple".to_string(),
             Vec::new(),
