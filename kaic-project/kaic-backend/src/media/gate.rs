@@ -33,10 +33,14 @@ fn rejection_reason(license: &str) -> &'static str {
     match license {
         // Монтаж — это производное произведение по определению, а ND его
         // прямо запрещает. Тут нечего решать: такой ассет непригоден.
-        "by-nd" | "by-nc-nd" => "лицензия ND запрещает производные произведения, а монтаж — производное",
+        "by-nd" | "by-nc-nd" => {
+            "лицензия ND запрещает производные произведения, а монтаж — производное"
+        }
         // NC ограничивает коммерческое использование. Пайплайн не знает,
         // коммерческий ли результат, и решать это за пользователя не вправе.
-        "by-nc" | "by-nc-sa" => "лицензия NC ограничивает коммерческое использование; для v1 не разрешена",
+        "by-nc" | "by-nc-sa" => {
+            "лицензия NC ограничивает коммерческое использование; для v1 не разрешена"
+        }
         // ShareAlike навязывает свою лицензию всему результату монтажа —
         // это решение о лицензировании проекта, не техническая деталь.
         "by-sa" => "ShareAlike распространяет свою лицензию на весь результат; для v1 не разрешена",
@@ -75,9 +79,15 @@ impl std::fmt::Display for GateRejection {
                 asset_id,
                 license,
                 reason,
-            } => write!(f, "ассет {asset_id}: лицензия '{license}' не допущена — {reason}"),
+            } => write!(
+                f,
+                "ассет {asset_id}: лицензия '{license}' не допущена — {reason}"
+            ),
             Self::AttributionMissing { asset_id } => {
-                write!(f, "ассет {asset_id}: лицензия требует атрибуции, но автор не указан")
+                write!(
+                    f,
+                    "ассет {asset_id}: лицензия требует атрибуции, но автор не указан"
+                )
             }
             Self::RightsNotConfirmed { asset_id } => {
                 write!(f, "ассет {asset_id}: права пользователя не подтверждены")
@@ -274,9 +284,14 @@ mod tests {
 
             match result {
                 Err(GateRejection::LicenseNotAllowed { reason, .. }) => {
-                    assert!(reason.contains("ND"), "причина должна называть ND: {reason}");
+                    assert!(
+                        reason.contains("ND"),
+                        "причина должна называть ND: {reason}"
+                    );
                 }
-                other => panic!("ND-лицензия {license} обязана быть отвергнута, получено {other:?}"),
+                other => {
+                    panic!("ND-лицензия {license} обязана быть отвергнута, получено {other:?}")
+                }
             }
         }
     }
@@ -312,7 +327,10 @@ mod tests {
         let manifest = manifest_with(
             "a",
             MediaKind::Image,
-            licensed("by", "\"Mountains\" by Kiwi Tom is licensed under CC BY 2.0."),
+            licensed(
+                "by",
+                "\"Mountains\" by Kiwi Tom is licensed under CC BY 2.0.",
+            ),
         );
 
         let admitted = admit(&manifest, "a").expect("CC-BY допущен");
@@ -328,7 +346,10 @@ mod tests {
 
             let admitted = admit(&manifest, "a").expect("public domain допущен");
 
-            assert!(admitted.credit().is_none(), "{license} не требует атрибуции");
+            assert!(
+                admitted.credit().is_none(),
+                "{license} не требует атрибуции"
+            );
         }
     }
 

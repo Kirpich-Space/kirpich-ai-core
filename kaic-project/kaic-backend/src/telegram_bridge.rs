@@ -191,7 +191,9 @@ impl TelegramConfig {
             Ok(raw) => serde_yaml::from_str(&raw)
                 .with_context(|| format!("не удалось разобрать {}", path.display())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("не удалось прочитать {}", path.display())),
+            Err(err) => {
+                Err(err).with_context(|| format!("не удалось прочитать {}", path.display()))
+            }
         }
     }
 }
@@ -432,17 +434,24 @@ async fn on_message(bot: Bot, msg: Message, state: BridgeState) -> Result<()> {
         return Ok(());
     }
 
-    let mut progress = Progress::start(&bot, msg.chat.id, "🔎 Принял задачу, определяю категорию…").await?;
+    let mut progress =
+        Progress::start(&bot, msg.chat.id, "🔎 Принял задачу, определяю категорию…").await?;
 
     let task = match create_task(&state, &text).await {
         Ok(task) => task,
         Err(err) => {
-            progress.step(format!("❌ Не удалось создать задачу: {err:#}")).await;
+            progress
+                .step(format!("❌ Не удалось создать задачу: {err:#}"))
+                .await;
             return Ok(());
         }
     };
     progress
-        .step(format!("📂 Категория: {} · задача {}", task.category, short_id(task.id)))
+        .step(format!(
+            "📂 Категория: {} · задача {}",
+            task.category,
+            short_id(task.id)
+        ))
         .await;
     progress.step("⚙️ Подбираю модель и выполняю…").await;
 
@@ -455,23 +464,18 @@ async fn on_message(bot: Bot, msg: Message, state: BridgeState) -> Result<()> {
     };
 
     match finished.status.as_str() {
-        "waiting_for_human" => {
-            match finished.last_with_role(DRAFT_ROLE) {
-                Some(draft) => {
-                    let sink: Arc<dyn DraftSink> = Arc::new(BotChatSink::new(
-                        bot.clone(),
-                        msg.chat.id,
-                        "этот чат",
-                    ));
-                    offer_draft(&bot, &state, &finished, draft, sink, msg.chat.id).await?;
-                }
-                None => {
-                    progress
-                        .step("⏸️ Задача ждёт решения человека, но черновика в контексте нет.")
-                        .await;
-                }
+        "waiting_for_human" => match finished.last_with_role(DRAFT_ROLE) {
+            Some(draft) => {
+                let sink: Arc<dyn DraftSink> =
+                    Arc::new(BotChatSink::new(bot.clone(), msg.chat.id, "этот чат"));
+                offer_draft(&bot, &state, &finished, draft, sink, msg.chat.id).await?;
             }
-        }
+            None => {
+                progress
+                    .step("⏸️ Задача ждёт решения человека, но черновика в контексте нет.")
+                    .await;
+            }
+        },
         "done" => {
             let answer = finished
                 .last_with_role("assistant")
@@ -485,7 +489,8 @@ async fn on_message(bot: Bot, msg: Message, state: BridgeState) -> Result<()> {
             if let Some(artifact) = finished.last_with_role(ARTIFACT_ROLE) {
                 let path = std::path::PathBuf::from(artifact);
                 if path.is_file() {
-                    if let Err(err) = progress.preview(path, "Результат монтажа").await {
+                    if let Err(err) = progress.preview(path, "Результат монтажа").await
+                    {
                         // Результат уже описан текстом выше — не отправившееся
                         // превью не повод считать задачу проваленной.
                         tracing::warn!("не удалось отправить результат: {err:#}");
@@ -496,11 +501,17 @@ async fn on_message(bot: Bot, msg: Message, state: BridgeState) -> Result<()> {
             }
         }
         "failed" => {
-            let reason = finished.last_with_role("system").unwrap_or("причина не записана");
-            progress.step(format!("❌ Задача завершилась ошибкой: {reason}")).await;
+            let reason = finished
+                .last_with_role("system")
+                .unwrap_or("причина не записана");
+            progress
+                .step(format!("❌ Задача завершилась ошибкой: {reason}"))
+                .await;
         }
         other => {
-            progress.step(format!("ℹ️ Задача в состоянии «{other}».")).await;
+            progress
+                .step(format!("ℹ️ Задача в состоянии «{other}»."))
+                .await;
         }
     }
 
@@ -566,7 +577,9 @@ async fn on_callback(bot: Bot, query: CallbackQuery, state: BridgeState) -> Resu
     // Кнопки — тот же уровень доступа, что и сообщения: нажатие отправляет
     // сообщение от имени пользователя, и чужому оно недоступно.
     if state.owner.authorize(query.from.id.0 as i64).await == OwnerDecision::Denied {
-        bot.answer_callback_query(query.id).text("Недоступно.").await?;
+        bot.answer_callback_query(query.id)
+            .text("Недоступно.")
+            .await?;
         return Ok(());
     }
 
@@ -643,14 +656,17 @@ async fn on_callback(bot: Bot, query: CallbackQuery, state: BridgeState) -> Resu
 
             match pending.sink.deliver(&payload).await {
                 Ok(()) => {
-                    if let Err(err) = append_audit(&state.config.audit_log_path, &AuditRecord {
-                        at: Utc::now(),
-                        task_id: pending.task_id,
-                        target: pending.sink.describe(),
-                        text_hash: pending.text_hash,
-                        labeled: with_label,
-                        approval_id: id,
-                    }) {
+                    if let Err(err) = append_audit(
+                        &state.config.audit_log_path,
+                        &AuditRecord {
+                            at: Utc::now(),
+                            task_id: pending.task_id,
+                            target: pending.sink.describe(),
+                            text_hash: pending.text_hash,
+                            labeled: with_label,
+                            approval_id: id,
+                        },
+                    ) {
                         tracing::error!("отправлено, но не записано в журнал: {err:#}");
                     }
                     let note = if with_label {
@@ -701,7 +717,9 @@ async fn verify(state: &BridgeState, pending: &PendingDraft) -> Verdict {
     };
 
     match task.last_with_role(DRAFT_ROLE) {
-        Some(current) if hash_text(current) == pending.text_hash => Verdict::Approved(current.to_string()),
+        Some(current) if hash_text(current) == pending.text_hash => {
+            Verdict::Approved(current.to_string())
+        }
         _ => Verdict::Changed,
     }
 }
@@ -711,7 +729,9 @@ async fn verify(state: &BridgeState, pending: &PendingDraft) -> Verdict {
 async fn finish_card(bot: &Bot, pending: &PendingDraft, note: &str) {
     if let Err(err) = bot
         .edit_message_reply_markup(pending.origin_chat, pending.prompt_message)
-        .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
+        .reply_markup(InlineKeyboardMarkup::new(
+            Vec::<Vec<InlineKeyboardButton>>::new(),
+        ))
         .await
     {
         tracing::warn!("не удалось убрать кнопки: {err}");
@@ -791,7 +811,12 @@ async fn create_task(state: &BridgeState, text: &str) -> Result<ApiTask> {
 
 async fn fetch_task(state: &BridgeState, id: Uuid) -> Result<Option<ApiTask>> {
     let url = format!("{}/tasks/{}", state.config.api_base_url, id);
-    let response = state.http.get(&url).send().await.context("Control Center API недоступен")?;
+    let response = state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .context("Control Center API недоступен")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -805,10 +830,17 @@ async fn fetch_task(state: &BridgeState, id: Uuid) -> Result<Option<ApiTask>> {
 }
 
 /// Ждёт терминального состояния задачи, отражая смену статуса в прогрессе.
-async fn await_completion(state: &BridgeState, id: Uuid, progress: &mut Progress) -> Result<ApiTask> {
+async fn await_completion(
+    state: &BridgeState,
+    id: Uuid,
+    progress: &mut Progress,
+) -> Result<ApiTask> {
     let mut last_status = String::new();
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(state.config.poll_interval_ms)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            state.config.poll_interval_ms,
+        ))
+        .await;
 
         let Some(task) = fetch_task(state, id).await? else {
             anyhow::bail!("задача {id} исчезла");
@@ -821,7 +853,10 @@ async fn await_completion(state: &BridgeState, id: Uuid, progress: &mut Progress
             }
         }
 
-        if matches!(task.status.as_str(), "done" | "failed" | "cancelled" | "waiting_for_human") {
+        if matches!(
+            task.status.as_str(),
+            "done" | "failed" | "cancelled" | "waiting_for_human"
+        ) {
             return Ok(task);
         }
     }

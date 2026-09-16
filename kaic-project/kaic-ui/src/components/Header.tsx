@@ -1,5 +1,5 @@
-import { useState, type FormEvent } from 'react';
-import { controlCenter } from '../api/controlCenter';
+import { useEffect, useState, type FormEvent } from 'react';
+import { controlCenter, type ModelStatusDto } from '../api/controlCenter';
 import type { PendingTask } from '../types';
 
 interface HeaderProps {
@@ -20,6 +20,12 @@ export default function Header({ onTaskCreated, onTaskIdKnown, onTaskFailed }: H
   const [text, setText] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [models, setModels] = useState<ModelStatusDto[]>([]);
+  const [selectedModel, setSelectedModel] = useState('');
+
+  useEffect(() => {
+    controlCenter.listModels().then(setModels).catch(() => setModels([]));
+  }, []);
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -38,7 +44,10 @@ export default function Header({ onTaskCreated, onTaskIdKnown, onTaskFailed }: H
     setError(null);
 
     try {
-      const created = await controlCenter.createTask({ text: trimmed });
+      const created = await controlCenter.createTask({
+        text: trimmed,
+        ...(selectedModel ? { model: selectedModel } : {}),
+      });
       // POST /tasks уже возвращает созданную задачу с её реальным id —
       // передаём его наверх, TaskList уберёт placeholder, когда увидит
       // задачу с этим id в ответе GET /tasks.
@@ -65,6 +74,15 @@ export default function Header({ onTaskCreated, onTaskIdKnown, onTaskFailed }: H
           disabled={submitting}
           style={{ flex: 1, padding: 4 }}
         />
+        <select
+          aria-label="Модель"
+          value={selectedModel}
+          onChange={(event) => setSelectedModel(event.target.value)}
+          disabled={submitting}
+        >
+          <option value="">Авто</option>
+          {models.map((model) => <option key={model.model} value={model.model}>{model.model}</option>)}
+        </select>
         <button type="submit" disabled={submitting}>
           {submitting ? 'Создаю...' : 'Создать задачу'}
         </button>

@@ -11,6 +11,8 @@ mod control_center_api;
 #[cfg(feature = "embedded-backend")]
 mod embedded_backend;
 mod http_client;
+#[cfg(feature = "embedded-backend")]
+mod llama_common_adapter;
 mod mcp;
 mod media;
 mod model_backend;
@@ -19,16 +21,24 @@ mod router;
 mod scheduler;
 mod task_store;
 mod telegram_bridge;
+mod terminal;
 mod tool_gate;
+mod workspace_tools;
 
+use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+#[cfg(feature = "embedded-backend")]
+use anyhow::Context;
 use anyhow::Result;
+
+#[cfg(feature = "embedded-backend")]
+use embedded_backend::EmbeddedBackend;
 
 use capability_registry::CapabilityRegistry;
 use control_center_api::{serve, AppState};
-use model_backend::LmStudioBackend;
+use model_backend::{LmStudioBackend, ModelBackend};
 use resource_registry::ResourceRegistry;
 use scheduler::Scheduler;
 use task_store::TaskStore;
@@ -68,24 +78,58 @@ use task_store::TaskStore;
 /// это видно. Вводить его — отдельная задача.
 const TOTAL_MODEL_MEMORY_MB: u32 = 24495;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    Serve,
+    Terminal,
+}
+
+fn parse_run_mode(args: &[&str]) -> anyhow::Result<RunMode> {
+    match args {
+        [] => Ok(RunMode::Serve),
+        ["--terminal" | "terminal"] => Ok(RunMode::Terminal),
+        _ => anyhow::bail!("использование: kaic [--terminal|terminal]"),
+    }
+}
+
+fn should_preload_always_loaded(mode: RunMode) -> bool {
+    mode == RunMode::Serve
+}
+
+fn should_shutdown_scheduler(mode: RunMode) -> bool {
+    mode == RunMode::Serve
+}
+
+fn default_log_filter(mode: RunMode) -> &'static str {
+    match mode {
+        RunMode::Serve => "info",
+        RunMode::Terminal => "error",
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // `fmt::init()` при незаданном RUST_LOG пропускает только ERROR — то есть
-    // весь info!/warn! приложения молчал, включая стартовую диагностику и
-    // предупреждения Scheduler'а о неудачных загрузках. Умолчание должно быть
-    // info: логи существуют, чтобы их читали. RUST_LOG по-прежнему главнее.
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let run_mode = parse_run_mode(&arg_refs)?;
+
+    // Server сохраняет подробную диагностику. Интерактивный terminal по
+    // умолчанию показывает только ошибки, чтобы служебные Scheduler-логи не
+    // ломали интерфейс; RUST_LOG по-прежнему главнее этого выбора.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(default_log_filter(run_mode))
+            }),
         )
         .init();
 
-    // Секрет Control Center читается ПЕРВЫМ делом — до Resource Registry,
-    // до выгрузки моделей и до любого касания GPU. Отсутствие секрета это
-    // отказ конфигурации, а не отказ во время работы: узнать о нём надо за
-    // миллисекунды, а не после минуты загрузки модели.
-    let control_token = control_auth::ControlToken::from_env()?;
+    // Секрет нужен только сетевому Control Center. Локальный terminal mode не
+    // открывает порт и не должен требовать фиктивный токен.
+    let control_token = match run_mode {
+        RunMode::Serve => Some(control_auth::ControlToken::from_env()?),
+        RunMode::Terminal => None,
+    };
 
     let capability_registry = Arc::new(CapabilityRegistry::from_file(
         "config/capability_registry.yaml",
@@ -94,7 +138,29 @@ async fn main() -> Result<()> {
         "config/resource_registry.yaml",
     )?);
 
-    let backend = Arc::new(LmStudioBackend::new("http://localhost:1234", None));
+    let backend_name = env::var("KAIC_BACKEND").unwrap_or_else(|_| "lmstudio".to_string());
+    let backend: Arc<dyn ModelBackend> = match backend_name.as_str() {
+        "lmstudio" => Arc::new(LmStudioBackend::new("http://localhost:1234", None)),
+        "embedded" => {
+            #[cfg(feature = "embedded-backend")]
+            {
+                let model_path = env::var("KAIC_EMBEDDED_MODEL_PATH")
+                    .context("KAIC_EMBEDDED_MODEL_PATH обязателен для KAIC_BACKEND=embedded")?;
+                let gpu_layers = env::var("KAIC_EMBEDDED_GPU_LAYERS")
+                    .unwrap_or_else(|_| "0".to_string())
+                    .parse()
+                    .context("KAIC_EMBEDDED_GPU_LAYERS должен быть целым числом")?;
+                Arc::new(EmbeddedBackend::new(model_path, gpu_layers)?)
+            }
+            #[cfg(not(feature = "embedded-backend"))]
+            {
+                anyhow::bail!("KAIC_BACKEND=embedded требует сборку с --features embedded-backend")
+            }
+        }
+        other => {
+            anyhow::bail!("неизвестный KAIC_BACKEND: {other} (ожидался lmstudio или embedded)")
+        }
+    };
 
     let scheduler = Arc::new(Scheduler::new(
         capability_registry,
@@ -102,11 +168,13 @@ async fn main() -> Result<()> {
         backend,
         TOTAL_MODEL_MEMORY_MB,
     ));
-    // Сначала убрать чужое, потом грузить своё. Прошлый процесс мог
-    // завершиться как угодно — от Ctrl+C до краха — и оставить в LM Studio
-    // загруженные модели, о которых мы ничего не знаем.
-    scheduler.unload_stale_instances().await?;
-    scheduler.preload_always_loaded().await?;
+    // Server очищает чужие инстансы и заранее грузит always_loaded модели.
+    // Терминал должен открыться до первого обращения к провайдеру: Scheduler
+    // выполнит необходимую загрузку по первому пользовательскому запросу.
+    if should_preload_always_loaded(run_mode) {
+        scheduler.unload_stale_instances().await?;
+        scheduler.preload_always_loaded().await?;
+    }
 
     // Что система реально может при текущем бюджете. Только сообщение:
     // старт не блокируется, поведение подбора не меняется. Выяснение этих
@@ -126,23 +194,65 @@ async fn main() -> Result<()> {
         control: control_center_api::TaskControl::default(),
     };
 
-    // Telegram Bridge — такой же HTTP-клиент Control Center API, как Electron.
-    // Поднимается до serve(), чтобы к моменту первого сообщения API уже слушал.
-    // Без TELOXIDE_TOKEN просто не запускается: backend обязан работать и без
-    // Telegram.
-    let telegram_config = telegram_bridge::TelegramConfig::load_or_default("config/telegram.yaml")?;
-    telegram_bridge::spawn_if_configured(telegram_config).await;
+    let result = match run_mode {
+        RunMode::Serve => {
+            // Telegram Bridge — такой же HTTP-клиент Control Center API, как Electron.
+            // Без TELOXIDE_TOKEN backend продолжает работать без Telegram.
+            let telegram_config =
+                telegram_bridge::TelegramConfig::load_or_default("config/telegram.yaml")?;
+            telegram_bridge::spawn_if_configured(telegram_config).await;
 
-    let addr: SocketAddr = "127.0.0.1:4545".parse()?;
-    let result = serve(state, addr, control_token).await;
+            let addr: SocketAddr = "127.0.0.1:4545".parse()?;
+            serve(
+                state,
+                addr,
+                control_token.expect("serve mode always has a control token"),
+            )
+            .await
+        }
+        RunMode::Terminal => terminal::run(&state).await,
+    };
 
     // Дополнение к стартовой чистке, не замена ей: срабатывает только при
     // корректном завершении (Ctrl+C через graceful_shutdown). При kill или
     // краше этот код не выполнится — и это нормально, следствие уберёт
     // чистка при следующем старте.
-    if let Err(err) = scheduler_for_cleanup.unload_stale_instances().await {
-        tracing::warn!("не удалось выгрузить модели при завершении: {err:#}");
+    if should_shutdown_scheduler(run_mode) {
+        if let Err(err) = scheduler_for_cleanup.shutdown().await {
+            tracing::warn!("не удалось выгрузить модели при завершении: {err:#}");
+        }
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_flag_selects_repl_without_changing_the_default_server_mode() {
+        assert_eq!(parse_run_mode(&[]).unwrap(), RunMode::Serve);
+        assert_eq!(parse_run_mode(&["--terminal"]).unwrap(), RunMode::Terminal);
+        assert_eq!(parse_run_mode(&["terminal"]).unwrap(), RunMode::Terminal);
+        assert!(parse_run_mode(&["--unknown"]).is_err());
+    }
+
+    #[test]
+    fn terminal_defaults_to_quiet_logs_while_server_keeps_diagnostics() {
+        assert_eq!(default_log_filter(RunMode::Terminal), "error");
+        assert_eq!(default_log_filter(RunMode::Serve), "info");
+    }
+
+    #[test]
+    fn only_server_mode_shuts_down_provider_models() {
+        assert!(should_shutdown_scheduler(RunMode::Serve));
+        assert!(!should_shutdown_scheduler(RunMode::Terminal));
+    }
+
+    #[test]
+    fn only_server_mode_preloads_always_loaded_models() {
+        assert!(should_preload_always_loaded(RunMode::Serve));
+        assert!(!should_preload_always_loaded(RunMode::Terminal));
+    }
 }

@@ -11,6 +11,7 @@
 //! модели на накопленную историю сообщений задачи.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -97,7 +98,7 @@ impl Message {
 /// Agent'у передавать накопленный контекст задачи (см. Task Store) без
 /// изменения этого интерфейса, когда HITL-цикл продолжает работу после
 /// паузы на решение пользователя.
-
+///
 /// Описание одного инструмента, как оно уходит провайдеру.
 ///
 /// Нейтрально к источнику: сюда сводятся и инструменты MCP-сервера, и любые
@@ -172,6 +173,56 @@ impl GenerateResponse {
     }
 }
 
+/// Whether a backend can return provider-native tool calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendCapability {
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BackendCapabilities {
+    pub tool_calling: BackendCapability,
+}
+
+/// Structured error returned when a request requires a backend capability it lacks.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedToolCalling {
+    pub backend: &'static str,
+    pub requested_tool_count: usize,
+}
+
+impl fmt::Display for UnsupportedToolCalling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "backend '{}' does not support tool calling ({} tool(s) requested)",
+            self.backend, self.requested_tool_count
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedToolCalling {}
+
+/// Безопасный снимок состояния backend-а для диагностики и `/status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendStatus {
+    pub healthy: bool,
+    pub initialized: bool,
+    pub loaded_resident_models: Vec<String>,
+    pub configured_gpu_layers: Option<u32>,
+    pub device_offload_summary: Option<String>,
+    pub capabilities: BackendCapabilities,
+    /// Whether dropping the in-flight request can interrupt native inference.
+    /// This is explicit because cancellation of an async future is not enough
+    /// to stop a synchronous llama.cpp decode.
+    pub cancellation_supported: bool,
+    /// Whether the backend enforces a bounded inference timeout itself.
+    pub timeout_supported: bool,
+}
+
 /// Единый интерфейс для работы с любым источником LLM.
 ///
 /// Реализация не обязана быть быстрой или синхронной — все методы
@@ -184,6 +235,13 @@ pub trait ModelBackend: Send + Sync {
 
     /// Загружает модель в память. Если модель уже загружена — не ошибка.
     async fn load(&self, model: &str) -> Result<()>;
+
+    /// Загружает модель из явно указанного источника, если он задан.
+    /// Backend'ы без файлового источника используют обычный `load`.
+    async fn load_with_path(&self, model: &str, path: Option<&str>) -> Result<()> {
+        let _ = path;
+        self.load(model).await
+    }
 
     /// Выгружает модель из памяти. Если модель не была загружена — не ошибка.
     async fn unload(&self, model: &str) -> Result<()>;
@@ -217,6 +275,59 @@ pub trait ModelBackend: Send + Sync {
     /// модель это одно и то же.
     async fn unload_instance(&self, instance_id: &str) -> Result<()> {
         self.unload(instance_id).await
+    }
+
+    /// Стабильное имя реализации для status/диагностики.
+    fn backend_name(&self) -> &'static str {
+        "external"
+    }
+
+    /// Provider capabilities exposed without probing or guessing from model output.
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            tool_calling: BackendCapability::Unsupported,
+        }
+    }
+
+    /// Whether cancelling the request can interrupt backend work.
+    fn cancellation_supported(&self) -> bool {
+        false
+    }
+
+    /// Whether the backend applies a bounded generation timeout.
+    fn timeout_supported(&self) -> bool {
+        false
+    }
+
+    /// Краткая безопасная диагностика конфигурации backend-а.
+    fn backend_config(&self) -> Option<String> {
+        None
+    }
+
+    /// Возвращает безопасные runtime-метрики backend-а.
+    async fn runtime_status(&self) -> Result<BackendStatus> {
+        Ok(BackendStatus {
+            healthy: true,
+            initialized: true,
+            loaded_resident_models: self.loaded_instances().await?,
+            configured_gpu_layers: None,
+            device_offload_summary: None,
+            capabilities: self.capabilities(),
+            cancellation_supported: self.cancellation_supported(),
+            timeout_supported: self.timeout_supported(),
+        })
+    }
+
+    /// Освобождает все инстансы backend-а при штатном завершении.
+    ///
+    /// Реализации, умеющие перечислять инстансы, получают общий lifecycle:
+    /// enumerate → unload each. Ошибка одного инстанса не маскируется.
+    async fn shutdown(&self) -> Result<()> {
+        let instances = self.loaded_instances().await?;
+        for instance in instances {
+            self.unload_instance(&instance).await?;
+        }
+        Ok(())
     }
 }
 
@@ -285,6 +396,14 @@ impl LmStudioBackend {
 
 #[async_trait]
 impl ModelBackend for LmStudioBackend {
+    fn cancellation_supported(&self) -> bool {
+        true
+    }
+
+    fn timeout_supported(&self) -> bool {
+        true
+    }
+
     async fn is_loaded(&self, model: &str) -> Result<bool> {
         let url = format!("{}/api/v1/models", self.base_url);
         let response: ModelsListResponse = self
@@ -489,6 +608,16 @@ impl ModelBackend for LmStudioBackend {
         }
 
         Ok(GenerateResponse::Text(message.content.unwrap_or_default()))
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "lmstudio"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            tool_calling: BackendCapability::Supported,
+        }
     }
 }
 
@@ -867,7 +996,10 @@ mod timeout_tests {
         // задачи как «Ошибка: {текст}» и читается человеком. Общее
         // «ошибка генерации» было бы тем же молчаливым отказом, только с
         // другим лицом.
-        assert_eq!(text, "LM Studio вернула ответ без вариантов (пустой choices)");
+        assert_eq!(
+            text,
+            "LM Studio вернула ответ без вариантов (пустой choices)"
+        );
 
         server.abort();
     }

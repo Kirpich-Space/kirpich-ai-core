@@ -447,21 +447,27 @@ Nemotron:
         assert!(out.contains("# комментарий про измерение"));
         assert!(out.contains("  temperature: 0.2"));
         // Соседняя модель не задета.
-        assert!(out.contains("Nemotron:
+        assert!(out.contains(
+            "Nemotron:
   vram_mb: 25723
-  temperature: null"));
+  temperature: null"
+        ));
     }
 
     #[test]
     fn set_temperature_touches_only_the_named_model() {
         let out = replace_temperature_line(SAMPLE, "Nemotron", Some(1.5)).expect("правка удалась");
 
-        assert!(out.contains("Nemotron:
+        assert!(out.contains(
+            "Nemotron:
   vram_mb: 25723
-  temperature: 1.5"));
+  temperature: 1.5"
+        ));
         // У Fable9B осталось прежнее значение.
-        assert!(out.contains("  temperature: null
-  load_seconds: 9"));
+        assert!(out.contains(
+            "  temperature: null
+  load_seconds: 9"
+        ));
     }
 
     #[test]
@@ -485,9 +491,11 @@ Nemotron:
 ";
         let out = replace_temperature_line(without, "Fable9B", Some(0.3)).unwrap();
 
-        assert!(out.contains("Fable9B:
+        assert!(out.contains(
+            "Fable9B:
   vram_mb: 5734
-  temperature: 0.3"));
+  temperature: 0.3"
+        ));
     }
 
     #[test]
@@ -496,7 +504,6 @@ Nemotron:
             .expect_err("несуществующая модель — ошибка");
         assert!(err.to_string().contains("не найден"));
     }
-
 
     #[test]
     fn temperature_outside_our_range_is_rejected() {
@@ -545,14 +552,19 @@ Fable9B:
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "остался временный файл: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "остался временный файл: {leftovers:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn the_temp_file_is_unique_per_call_and_sits_next_to_the_target() {
-        let target = std::env::temp_dir().join("some-dir").join("resource_registry.yaml");
+        let target = std::env::temp_dir()
+            .join("some-dir")
+            .join("resource_registry.yaml");
 
         let first = temp_path_for(&target);
         let second = temp_path_for(&target);
@@ -648,7 +660,9 @@ Fable9B:
                 .map(|(model, value)| {
                     let registry = registry.clone();
                     std::thread::spawn(move || {
-                        registry.set_temperature(model, Some(value)).expect("запись удалась")
+                        registry
+                            .set_temperature(model, Some(value))
+                            .expect("запись удалась")
                     })
                 })
                 .collect();

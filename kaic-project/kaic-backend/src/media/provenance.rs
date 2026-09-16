@@ -129,7 +129,10 @@ mod tests {
             rights_confirmation: String::new(),
             confirmed_at: Utc::now(),
         };
-        assert!(!base.is_confirmed(), "пустое подтверждение — не подтверждение");
+        assert!(
+            !base.is_confirmed(),
+            "пустое подтверждение — не подтверждение"
+        );
 
         let blank = UserProvenance {
             rights_confirmation: "   ".to_string(),

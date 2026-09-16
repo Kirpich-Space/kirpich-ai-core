@@ -74,6 +74,7 @@ anyhow = "1"
 # поэтому обычный `cargo build` не требует CUDA Toolkit, как и раньше.
 llama-cpp-4 = { version = "0.4.2", optional = true }
 encoding_rs = { version = "0.8", optional = true }
+
 # MCP-клиент — официальный SDK. Вариант выбран архитектором после разведки:
 # rmcp + транспорт stdio + локальные модели.
 #
@@ -92,6 +93,14 @@ rmcp = { version = "3.1.2", default-features = false, features = [
     "client",
     "transport-child-process",
 ] }
+
+# Descriptor-relative filesystem operations for the sandboxed KAIC workspace.
+# Already present transitively in Cargo.lock; direct use enables openat2 with
+# RESOLVE_BENEATH/NO_SYMLINKS so path checks cannot race through symlinks.
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[build-dependencies]
+cc = "1"
 
 [features]
 # CPU-инференс через встроенный llama.cpp, без внешнего LM Studio.

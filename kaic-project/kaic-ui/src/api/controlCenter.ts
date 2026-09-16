@@ -1,14 +1,7 @@
-// Тонкая обёртка над fetch() для Control Center API (см. control_center_api.rs).
+// Тонкая типизированная обёртка над preload/IPC-мостом Control Center.
 // Никакой бизнес-логики здесь нет: только типы ответов backend'а,
 // построение запросов и единообразная обработка ошибок.
-// Явно не используем axios/react-query/redux/zustand — обычного fetch()
-// достаточно для того объёма запросов, что есть у KAIC сейчас.
-
-// Адрес backend'а. По умолчанию — порт, зашитый в main.rs (4545).
-// Переопределяется переменной окружения VITE_API_BASE при сборке/запуске
-// Vite, если когда-нибудь понадобится указать другой адрес — без правки
-// кода и без отдельной системы .env-файлов.
-export const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:4545';
+// Renderer не знает URL, HTTP-методы, заголовки и runtime-секрет.
 
 // --- Типы данных ---
 // Соответствуют структурам, которые сериализует backend (Task, TaskStatus,
@@ -30,6 +23,12 @@ export interface ContextEntry {
   at: string; // ISO 8601, как отдаёт chrono::DateTime<Utc>
 }
 
+/** Structured backend/model provenance, absent for old or not-yet-run tasks. */
+export interface ExecutionMetadata {
+  backend: string;
+  model: string;
+}
+
 /** Задача целиком — то, что возвращают GET /tasks, GET /tasks/:id, POST /tasks. */
 export interface Task {
   id: string;
@@ -39,6 +38,7 @@ export interface Task {
   updated_at: string;
   context: ContextEntry[];
   pending_telegram_message_id: number | null;
+  execution?: ExecutionMetadata;
 }
 
 /** Тело запроса на создание задачи (см. CreateTaskRequest в control_center_api.rs). */
@@ -46,6 +46,7 @@ export interface CreateTaskRequest {
   text: string;
   category?: string;
   allow_manual?: boolean;
+  model?: string;
 }
 
 /** Тело запроса на продолжение задачи (см. ContinueRequest). */
@@ -93,6 +94,13 @@ export interface StatusDto {
   /** Предел, после которого задачи получают отказ (а не встают в очередь). */
   max_concurrent_tasks: number;
   busy_models: BusyModelDto[];
+  /** Queue depth is always zero because Scheduler rejects over-capacity work. */
+  queue_depth: number;
+  /** idle, loading, unloading, or generating. */
+  inference_state: 'idle' | 'loading' | 'unloading' | 'generating';
+  /** Backend lifecycle limitations, reported rather than guessed. */
+  cancellation_supported: boolean;
+  timeout_supported: boolean;
   /** Что backend делает прямо сейчас, или null в покое.
    *  Во время загрузки модели `loaded_models` её ещё не содержит — она
    *  появится там только после завершения. Это поле объясняет промежуток:
@@ -137,36 +145,33 @@ export class ControlCenterError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    public readonly kind: 'configuration' | 'transport' | 'http' | 'protocol' | 'boundary' = 'protocol',
   ) {
     super(message);
     this.name = 'ControlCenterError';
   }
 }
 
-/** Общий каркас запроса: строит URL, шлёт JSON, разбирает ответ или ошибку. */
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  let response: Response;
+type BridgeMethod = keyof KaicControlCenterBridge;
+
+async function request<T>(method: BridgeMethod, ...args: unknown[]): Promise<T> {
+  const bridge = window.kaicControlCenter;
+  if (!bridge) {
+    throw new ControlCenterError(0, 'Control Center доступен только в Electron');
+  }
+  let result: ControlCenterIpcResult;
   try {
-    response = await fetch(`${API_BASE}${path}`, {
-      ...init,
-      headers: { 'Content-Type': 'application/json', ...init.headers },
-    });
+    result = await (bridge[method] as (...values: unknown[]) => Promise<ControlCenterIpcResult>)(...args);
   } catch {
-    // fetch() бросает TypeError, если backend недоступен (не запущен,
-    // неверный порт и т.п.) — заворачиваем в тот же тип ошибки, чтобы
-    // вызывающему коду не нужно было различать два разных вида исключений.
-    throw new ControlCenterError(0, 'Control Center API недоступен (backend не запущен?)');
+    throw new ControlCenterError(0, 'Control Center IPC недоступен', 'transport');
   }
-
-  if (!response.ok) {
-    const message = await response.text().catch(() => response.statusText);
-    throw new ControlCenterError(response.status, message || response.statusText);
+  if (!result || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+    throw new ControlCenterError(0, 'Control Center вернул некорректный IPC-ответ', 'protocol');
   }
-
-  // Роуты continue/pause/cancel не возвращают тело — в этом случае просто
-  // ничего не парсим и отдаём undefined.
-  const text = await response.text();
-  return (text ? JSON.parse(text) : undefined) as T;
+  if (!result.ok) {
+    throw new ControlCenterError(result.error.status, result.error.message, result.error.kind);
+  }
+  return result.value as T;
 }
 
 // --- Методы API ---
@@ -174,32 +179,32 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const controlCenter = {
   /** GET /tasks — список всех задач. */
-  listTasks: (): Promise<Task[]> => request<Task[]>('/tasks'),
+  listTasks: (): Promise<Task[]> => request<Task[]>('listTasks'),
 
   /** POST /tasks — создать задачу; пайплайн запускается на backend'е в фоне. */
   createTask: (body: CreateTaskRequest): Promise<Task> =>
-    request<Task>('/tasks', { method: 'POST', body: JSON.stringify(body) }),
+    request<Task>('createTask', body),
 
   /** GET /tasks/:id — одна задача. */
-  getTask: (id: string): Promise<Task> => request<Task>(`/tasks/${id}`),
+  getTask: (id: string): Promise<Task> => request<Task>('getTask', id),
 
   /** POST /tasks/:id/continue — продолжить задачу (после WaitingForHuman/Paused). */
   continueTask: (id: string, body: ContinueRequest = {}): Promise<void> =>
-    request<void>(`/tasks/${id}/continue`, { method: 'POST', body: JSON.stringify(body) }),
+    request<void>('continueTask', id, body),
 
   /** POST /tasks/:id/pause — поставить задачу на паузу. */
   pauseTask: (id: string): Promise<void> =>
-    request<void>(`/tasks/${id}/pause`, { method: 'POST' }),
+    request<void>('pauseTask', id),
 
   /** POST /tasks/:id/cancel — отменить задачу. */
   cancelTask: (id: string): Promise<void> =>
-    request<void>(`/tasks/${id}/cancel`, { method: 'POST' }),
+    request<void>('cancelTask', id),
 
   /** GET /models — все известные модели и их текущее состояние загрузки. */
-  listModels: (): Promise<ModelStatusDto[]> => request<ModelStatusDto[]>('/models'),
+  listModels: (): Promise<ModelStatusDto[]> => request<ModelStatusDto[]>('listModels'),
 
   /** GET /status — сводное состояние Scheduler'а (VRAM, загруженные модели). */
-  getStatus: (): Promise<StatusDto> => request<StatusDto>('/status'),
+  getStatus: (): Promise<StatusDto> => request<StatusDto>('getStatus'),
 
   /** POST /models/:name/temperature — задать температуру модели.
    *  Диапазон значения — TEMPERATURE_MIN..TEMPERATURE_MAX; проверка здесь
@@ -209,8 +214,5 @@ export const controlCenter = {
    *  и снова начнёт действовать его умолчание. Модель не обязана быть
    *  загружена. Возвращает обновлённый список моделей. */
   setModelTemperature: (name: string, temperature: number | null): Promise<ModelStatusDto[]> =>
-    request<ModelStatusDto[]>(`/models/${encodeURIComponent(name)}/temperature`, {
-      method: 'POST',
-      body: JSON.stringify({ temperature }),
-    }),
+    request<ModelStatusDto[]>('setModelTemperature', name, temperature),
 };

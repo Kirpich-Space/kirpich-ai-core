@@ -155,7 +155,10 @@ impl KaicEngine {
         // без грамматики поведение не меняется ни на шаг.
         let sampler = match params.grammar.as_deref() {
             Some(grammar) => {
-                println!("[engine] sampler с грамматикой ({} символов)", grammar.len());
+                println!(
+                    "[engine] sampler с грамматикой ({} символов)",
+                    grammar.len()
+                );
                 LlamaSampler::chain_simple([
                     LlamaSampler::grammar(&self.model, grammar, GRAMMAR_ROOT_RULE),
                     LlamaSampler::temp(params.temperature),

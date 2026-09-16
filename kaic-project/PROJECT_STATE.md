@@ -1,5 +1,12 @@
 # KAIC Project State
 
+> **Current implementation update — 2026-09-08:** EmbeddedBackend is now a working
+> optional `ModelBackend` implementation, wired through Scheduler/API with CPU and
+> CUDA feature modes. It supports GGUF loading, per-model `ResourceEntry.path`,
+> inference, unload and graceful shutdown. `/status` reports the selected backend
+> and safe runtime configuration. The historical sections below describe the
+> archive snapshot and are retained for provenance.
+
 Документ для продолжения разработки в новом чате без потери контекста.
 Актуален на момент консервации — все факты ниже соответствуют реальному
 состоянию кода в архиве, а не намерениям или планам.

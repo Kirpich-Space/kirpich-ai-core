@@ -27,7 +27,10 @@
 //! приводится к общему кадру, и только потом склейка.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+
+use tokio::io::AsyncReadExt;
 
 use super::fetch::DownloadedAsset;
 
@@ -73,14 +76,21 @@ pub enum RenderError {
     NoInputs,
     Spawn(String),
     /// ffmpeg отработал, но вернул ненулевой код.
-    Failed { code: Option<i32>, stderr_tail: String },
-    TimedOut { seconds: u64 },
+    Failed {
+        code: Option<i32>,
+        stderr_tail: String,
+    },
+    TimedOut {
+        seconds: u64,
+    },
     Io(String),
     /// Процесс завершился успешно, но результат непригоден.
     EmptyOutput,
     /// В файле нет сигнатуры ISO-контейнера — успешный код возврата ещё не
     /// означает, что получилось видео.
-    NotAnMp4 { head: String },
+    NotAnMp4 {
+        head: String,
+    },
 }
 
 impl std::fmt::Display for RenderError {
@@ -180,6 +190,97 @@ fn looks_like_mp4(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
 }
 
+struct CancelChildOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl CancelChildOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelChildOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+async fn supervise_child(
+    mut child: tokio::process::Child,
+    mut stdout: tokio::process::ChildStdout,
+    mut stderr: tokio::process::ChildStderr,
+    timeout: Duration,
+    mut cancel: tokio::sync::oneshot::Receiver<()>,
+) -> Result<std::process::Output, RenderError> {
+    let stdout_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    let status = tokio::select! {
+        result = child.wait() => {
+            result.map_err(|error| RenderError::Spawn(error.to_string()))?
+        }
+        _ = tokio::time::sleep(timeout) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(RenderError::TimedOut { seconds: timeout.as_secs() });
+        }
+        _ = &mut cancel => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(RenderError::Spawn("renderer cancelled".to_string()));
+        }
+    };
+    let stdout = stdout_reader
+        .await
+        .map_err(|error| RenderError::Spawn(error.to_string()))?
+        .map_err(|error| RenderError::Spawn(error.to_string()))?;
+    let stderr = stderr_reader
+        .await
+        .map_err(|error| RenderError::Spawn(error.to_string()))?
+        .map_err(|error| RenderError::Spawn(error.to_string()))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn run_command_to_output(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+) -> Result<std::process::Output, RenderError> {
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| RenderError::Spawn(error.to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RenderError::Spawn("stdout pipe недоступен".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RenderError::Spawn("stderr pipe недоступен".to_string()))?;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let supervisor = tokio::spawn(supervise_child(child, stdout, stderr, timeout, cancel_rx));
+    let mut cancel_on_drop = CancelChildOnDrop(Some(cancel_tx));
+    let result = supervisor
+        .await
+        .map_err(|error| RenderError::Spawn(error.to_string()))?;
+    cancel_on_drop.disarm();
+    result
+}
+
 /// Рендерит слайдшоу из скачанных ассетов с вжатыми титрами.
 pub async fn render_slideshow(
     files: &[DownloadedAsset],
@@ -210,17 +311,7 @@ pub async fn render_slideshow(
     }
 
     let started = Instant::now();
-    let result = tokio::time::timeout(RENDER_TIMEOUT, command.output()).await;
-
-    let output_result = match result {
-        Ok(Ok(out)) => out,
-        Ok(Err(err)) => return Err(RenderError::Spawn(err.to_string())),
-        Err(_) => {
-            return Err(RenderError::TimedOut {
-                seconds: RENDER_TIMEOUT.as_secs(),
-            })
-        }
-    };
+    let output_result = run_command_to_output(command, RENDER_TIMEOUT).await?;
     let elapsed_ms = started.elapsed().as_millis();
 
     if !output_result.status.success() {
@@ -348,6 +439,71 @@ mod tests {
             ffmpeg_available().await,
             "ffmpeg должен быть в PATH для медиа-задач"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_renderer_future_kills_its_child_process() {
+        let dir = std::env::temp_dir().join(format!("kaic-render-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .env("PID_FILE", &pid_file)
+            .arg("-c")
+            .arg("printf '%s' \"$$\" > \"$PID_FILE\"; exec sleep 30");
+        let renderer = tokio::spawn(run_command_to_output(
+            command,
+            std::time::Duration::from_secs(60),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if std::fs::read_to_string(&pid_file).is_ok_and(|pid| !pid.trim().is_empty()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child must publish its pid");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim();
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        let process_start = std::fs::read_to_string(proc_path.join("stat"))
+            .unwrap()
+            .split_whitespace()
+            .nth(21)
+            .unwrap()
+            .to_string();
+        renderer.abort();
+        let _ = renderer.await;
+
+        let disappeared = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let same_process = std::fs::read_to_string(proc_path.join("stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.split_whitespace()
+                            .nth(21)
+                            .map(|start| start == process_start)
+                    })
+                    .unwrap_or(false);
+                if !same_process {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if disappeared.is_err() {
+            let stat = std::fs::read_to_string(proc_path.join("stat"))
+                .unwrap_or_else(|error| format!("stat unavailable: {error}"));
+            let cmdline = std::fs::read(proc_path.join("cmdline"))
+                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+                .unwrap_or_else(|error| format!("cmdline unavailable: {error}"));
+            panic!("renderer child was not reaped: stat={stat}; cmdline={cmdline}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

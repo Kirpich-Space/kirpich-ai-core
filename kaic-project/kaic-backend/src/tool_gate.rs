@@ -276,7 +276,10 @@ mod tests {
             panic!("должно было разрешиться");
         };
         assert_eq!(approved.approved_by(), Approval::Allowlist);
-        assert_eq!(approve_by_human(call("что_угодно")).approved_by(), Approval::Human);
+        assert_eq!(
+            approve_by_human(call("что_угодно")).approved_by(),
+            Approval::Human
+        );
     }
 
     #[test]
@@ -290,8 +293,16 @@ mod tests {
         let mut c = call("execute_blender_code");
         c.arguments = "{\"code\":\"import os\\nos.remove('x')\"}".to_string();
 
-        append_audit(&path, "task-1", "BlenderMCP", &c, None, Outcome::DeniedByHuman, "отказ")
-            .unwrap();
+        append_audit(
+            &path,
+            "task-1",
+            "BlenderMCP",
+            &c,
+            None,
+            Outcome::DeniedByHuman,
+            "отказ",
+        )
+        .unwrap();
         append_audit(
             &path,
             "task-1",

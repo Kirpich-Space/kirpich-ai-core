@@ -58,7 +58,11 @@ pub struct ControlToken(Arc<String>);
 /// остальное здесь.
 impl std::fmt::Debug for ControlToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ControlToken(<{} символов, скрыт>)", self.0.chars().count())
+        write!(
+            f,
+            "ControlToken(<{} символов, скрыт>)",
+            self.0.chars().count()
+        )
     }
 }
 
@@ -157,7 +161,10 @@ pub async fn require_token(
     if !token.accepts(presented.as_deref()) {
         return (
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer realm=\"kaic-control-center\"")],
+            [(
+                header::WWW_AUTHENTICATE,
+                "Bearer realm=\"kaic-control-center\"",
+            )],
             "Control Center API требует Authorization: Bearer <KAIC_CONTROL_TOKEN>",
         )
             .into_response();
@@ -179,7 +186,10 @@ mod tests {
             !shown.contains("supersecretvalue0123"),
             "Debug напечатал секрет: {shown}"
         );
-        assert!(shown.contains("скрыт"), "Debug должен говорить, что скрыл: {shown}");
+        assert!(
+            shown.contains("скрыт"),
+            "Debug должен говорить, что скрыл: {shown}"
+        );
     }
 
     #[test]

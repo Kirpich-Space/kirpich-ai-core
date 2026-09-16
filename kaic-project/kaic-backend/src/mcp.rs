@@ -20,9 +20,9 @@ use rmcp::{
     ServiceExt,
 };
 
-use crate::model_backend::ToolSpec;
 #[cfg(test)]
 use crate::model_backend::ToolCall;
+use crate::model_backend::ToolSpec;
 
 /// Переменные, которыми глушится телеметрия сервера.
 ///
@@ -112,8 +112,8 @@ impl McpClient {
             }
         });
 
-        let service = ()
-            .serve(TokioChildProcess::new(command).with_context(|| {
+        let service =
+            ().serve(TokioChildProcess::new(command).with_context(|| {
                 format!("не удалось запустить MCP-сервер '{}'", config.command)
             })?)
             .await
@@ -166,10 +166,7 @@ impl McpClient {
                 // вообще.
                 specs.push(ToolSpec {
                     name: tool.name.to_string(),
-                    description: tool
-                        .description
-                        .map(|d| d.to_string())
-                        .unwrap_or_default(),
+                    description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
                     input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
                 });
             }
@@ -201,11 +198,12 @@ impl McpClient {
         params.name = name.to_string().into();
         params.arguments = arguments;
 
-        let result = self
-            .service
-            .call_tool(params)
-            .await
-            .with_context(|| format!("вызов инструмента '{name}' у '{}' не удался", self.server_name))?;
+        let result = self.service.call_tool(params).await.with_context(|| {
+            format!(
+                "вызов инструмента '{name}' у '{}' не удался",
+                self.server_name
+            )
+        })?;
 
         let mut parts: Vec<String> = Vec::new();
         for content in result.content.iter() {
@@ -280,10 +278,17 @@ mod tests {
         let tools = client.list_tools().await.expect("tools/list");
         eprintln!("инструментов: {}", tools.len());
         for tool in &tools {
-            eprintln!("  {} — {}", tool.name, tool.description.lines().next().unwrap_or(""));
+            eprintln!(
+                "  {} — {}",
+                tool.name,
+                tool.description.lines().next().unwrap_or("")
+            );
         }
 
-        assert!(!tools.is_empty(), "сервер обязан отдать хотя бы один инструмент");
+        assert!(
+            !tools.is_empty(),
+            "сервер обязан отдать хотя бы один инструмент"
+        );
         // Схема нужна модели: инструмент без неё она вызвать не сможет.
         for tool in &tools {
             assert!(
@@ -293,7 +298,10 @@ mod tests {
             );
         }
 
-        client.shutdown().await.expect("подпроцесс завершился корректно");
+        client
+            .shutdown()
+            .await
+            .expect("подпроцесс завершился корректно");
     }
 
     #[test]
@@ -322,18 +330,25 @@ mod tests {
         // Сервер кричит о своей безопасности в описании — решение это не
         // задевает: разрешает только явный список.
         assert!(matches!(
-            crate::tool_gate::decide(&[], ToolCall {
-                id: "c1".to_string(),
-                name: name.clone(),
-                arguments: "{}".to_string(),
-            }),
+            crate::tool_gate::decide(
+                &[],
+                ToolCall {
+                    id: "c1".to_string(),
+                    name: name.clone(),
+                    arguments: "{}".to_string(),
+                }
+            ),
             crate::tool_gate::Decision::NeedsHuman(_)
         ));
         // И даже присутствие ДРУГОГО имени в списке его не разрешает.
         assert!(matches!(
             crate::tool_gate::decide(
                 &["get_scene_info".to_string()],
-                ToolCall { id: "c2".to_string(), name, arguments: "{}".to_string() }
+                ToolCall {
+                    id: "c2".to_string(),
+                    name,
+                    arguments: "{}".to_string()
+                }
             ),
             crate::tool_gate::Decision::NeedsHuman(_)
         ));
@@ -346,7 +361,9 @@ mod tests {
         let path = dir.join("mcp.yaml");
         std::fs::write(&path, "command: some-server\n").unwrap();
 
-        let config = McpServerConfig::load(&path).unwrap().expect("конфиг прочитан");
+        let config = McpServerConfig::load(&path)
+            .unwrap()
+            .expect("конфиг прочитан");
         assert!(
             config.auto_approve.is_empty(),
             "умолчание обязано быть пустым: иначе система однажды исполнит не то"

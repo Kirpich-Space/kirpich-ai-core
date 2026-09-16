@@ -16,6 +16,7 @@
 //! соединениями и переподключениями.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::{AllowHeaders, AllowMethods, CorsLayer};
 use uuid::Uuid;
 
+use crate::mcp::{McpClient, McpServerConfig};
 use crate::media::credits::{plan_render, RenderPlan};
 use crate::media::fetch as media_fetch;
 use crate::media::gate::{admit, AdmittedAsset, Timeline};
@@ -36,7 +38,6 @@ use crate::media::openverse;
 use crate::media::provenance::{Manifest, ManifestEntry};
 use crate::media::query as media_query_extract;
 use crate::media::render as media_render;
-use crate::mcp::{McpClient, McpServerConfig};
 use crate::model_backend::{GenerateRequest, GenerateResponse, Message, Role};
 use crate::resource_registry::ResourceRegistry;
 // Алиас: axum тоже экспортирует тип `Router`, поэтому наш классификатор
@@ -74,11 +75,16 @@ pub struct TaskControl {
 }
 
 impl TaskControl {
-    /// Отмечает задачу идущей и отдаёт приёмник сигнала отмены.
-    pub async fn register(&self, id: Uuid) -> tokio::sync::watch::Receiver<bool> {
+    /// Атомарно занимает task ID. `None` означает, что pipeline уже идёт;
+    /// существующий sender при этом не заменяется.
+    pub async fn try_register(&self, id: Uuid) -> Option<tokio::sync::watch::Receiver<bool>> {
+        let mut running = self.running.lock().await;
+        if running.contains_key(&id) {
+            return None;
+        }
         let (tx, rx) = tokio::sync::watch::channel(false);
-        self.running.lock().await.insert(id, tx);
-        rx
+        running.insert(id, tx);
+        Some(rx)
     }
 
     /// Снимает отметку. Вызывается на ЛЮБОМ исходе пайплайна, иначе
@@ -137,7 +143,10 @@ const ALLOWED_ORIGINS: [&str; 4] = [
 pub fn build_router(state: AppState, token: crate::control_auth::ControlToken) -> axum::Router {
     let origins: Vec<axum::http::HeaderValue> = ALLOWED_ORIGINS
         .iter()
-        .map(|o| o.parse().expect("список origin'ов задан константами и разбирается всегда"))
+        .map(|o| {
+            o.parse()
+                .expect("список origin'ов задан константами и разбирается всегда")
+        })
         .collect();
 
     let cors = CorsLayer::new()
@@ -217,8 +226,16 @@ async fn shutdown_signal() {
 
 // --- Обработчики ---
 
-async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<Task>>, ApiError> {
-    Ok(Json(state.task_store.list().await?))
+async fn list_tasks(State(state): State<AppState>) -> Result<Json<Vec<TaskResponse>>, ApiError> {
+    Ok(Json(
+        state
+            .task_store
+            .list()
+            .await?
+            .into_iter()
+            .map(TaskResponse::from)
+            .collect(),
+    ))
 }
 
 /// Тело запроса на создание новой задачи.
@@ -232,20 +249,28 @@ struct CreateTaskRequest {
     text: String,
     category: Option<String>,
     allow_manual: Option<bool>,
+    /// Ярлык модели из Resource Registry; если не задан, выбор остаётся авто.
+    model: Option<String>,
 }
 
 async fn create_task(
     State(state): State<AppState>,
     Json(body): Json<CreateTaskRequest>,
-) -> Result<Json<Task>, ApiError> {
+) -> Result<Json<TaskResponse>, ApiError> {
     let category = match &body.category {
         Some(c) => c.clone(),
         None => {
             let metadata = TaskMetadata::default();
-            TaskRouter::classify(&body.text, &metadata).as_str().to_string()
+            TaskRouter::classify(&body.text, &metadata)
+                .as_str()
+                .to_string()
         }
     };
     let allow_manual = body.allow_manual.unwrap_or(false);
+    let model_override =
+        validate_model_override(state.resource_registry.as_ref(), body.model.as_deref())
+            .map_err(ApiError::BadRequest);
+    let model_override = model_override?;
 
     let task = state.task_store.create(&category).await?;
     state
@@ -261,11 +286,9 @@ async fn create_task(
         )
         .await?;
 
-    let refreshed = state
-        .task_store
-        .get(task.id)
-        .await?
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("задача исчезла сразу после создания")))?;
+    let refreshed = state.task_store.get(task.id).await?.ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!("задача исчезла сразу после создания"))
+    })?;
 
     // Текст задачи в лог НЕ идёт: он приходит в том числе из Telegram и
     // может содержать личные данные. В логе только идентификатор и категория.
@@ -273,7 +296,11 @@ async fn create_task(
         "задача {} создана: категория '{}'{}",
         task.id,
         category,
-        if body.category.is_some() { "" } else { " (определена Router'ом)" }
+        if body.category.is_some() {
+            ""
+        } else {
+            " (определена Router'ом)"
+        }
     );
 
     // Задача уже сохранена в статусе Running — Electron получает её сразу
@@ -281,17 +308,253 @@ async fn create_task(
     // (подбор модели + генерация) идёт в фоне, а не блокирует этот запрос:
     // для L4/L5 моделей она может занять от секунд до минут, и Task Store
     // как раз для этого и существует.
-    tokio::spawn(run_task_pipeline(
+    tokio::spawn(run_task_pipeline_with_model(
         state.task_store.clone(),
         state.scheduler.clone(),
         state.control.clone(),
         task.id,
         category,
+        model_override,
         context_to_messages(&refreshed.context),
         allow_manual,
     ));
 
-    Ok(Json(refreshed))
+    Ok(Json(TaskResponse::from(refreshed)))
+}
+
+/// Результат одного синхронного хода терминального клиента.
+///
+/// Терминал получает данные из того же Task Store, что HTTP и Telegram, а не
+/// из отдельного сокращённого agent loop. Поэтому статус и ответ здесь —
+/// фактический результат `run_task_pipeline`.
+pub struct TerminalTurn {
+    pub task_id: Uuid,
+    pub status: TaskStatus,
+    pub reply: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Результат ожидания terminal turn вместе с сигналом завершения.
+pub enum TerminalTurnOutcome {
+    Completed(TerminalTurn),
+    Interrupted { task_id: Uuid },
+}
+
+/// Обычный программный вызов terminal turn без внешнего прерывания.
+pub async fn run_terminal_turn(
+    state: &AppState,
+    task_id: Option<Uuid>,
+    text: &str,
+    allow_manual: bool,
+) -> anyhow::Result<TerminalTurn> {
+    match run_terminal_turn_interruptible(
+        state,
+        task_id,
+        text,
+        allow_manual,
+        std::future::pending::<std::io::Result<()>>(),
+    )
+    .await?
+    {
+        TerminalTurnOutcome::Completed(turn) => Ok(turn),
+        TerminalTurnOutcome::Interrupted { .. } => {
+            unreachable!("pending interrupt future cannot complete")
+        }
+    }
+}
+
+/// Выполняет первый или последующий ход терминального диалога через штатный
+/// pipeline. Pending tool approval нельзя обойти новой пользовательской
+/// репликой: до явного решения задача остаётся `WaitingForHuman`.
+///
+/// Если `interrupt` срабатывает во время model/tool pipeline, задача сначала
+/// сохраняется как `Cancelled`, затем штатный [`TaskControl`] будит cooperative
+/// cancellation branch. Функция дожидается её cleanup и снимает регистрацию
+/// до возврата вызывающему коду. Уже отправленный внешнему MCP-серверу вызов
+/// нельзя транзакционно откатить; отмена гарантирует состояние KAIC, а не
+/// rollback внешнего побочного эффекта.
+pub async fn run_terminal_turn_interruptible<F>(
+    state: &AppState,
+    task_id: Option<Uuid>,
+    text: &str,
+    allow_manual: bool,
+    interrupt: F,
+) -> anyhow::Result<TerminalTurnOutcome>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    run_terminal_turn_interruptible_with_model(state, task_id, text, None, allow_manual, interrupt)
+        .await
+}
+
+pub async fn run_terminal_turn_interruptible_with_model<F>(
+    state: &AppState,
+    task_id: Option<Uuid>,
+    text: &str,
+    model_override: Option<&str>,
+    allow_manual: bool,
+    interrupt: F,
+) -> anyhow::Result<TerminalTurnOutcome>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    if text.trim().is_empty() {
+        anyhow::bail!("пустой terminal-запрос не отправлен");
+    }
+
+    let (task_id, category, stored, mut cancel_rx) = match task_id {
+        Some(id) => {
+            let task = state
+                .task_store
+                .get(id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("terminal-задача {id} не найдена"))?;
+            if task.status == TaskStatus::WaitingForHuman {
+                anyhow::bail!(
+                    "terminal-задача {id} ожидает решения по инструменту; новая реплика не отправлена"
+                );
+            }
+            let cancel_rx = state
+                .control
+                .try_register(id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("terminal-задача {id} уже выполняется"))?;
+            let category = task.category;
+            let stored = match state
+                .task_store
+                .append_context_and_set_status(
+                    id,
+                    ContextEntry {
+                        role: "user".to_string(),
+                        content: text.to_string(),
+                        at: Utc::now(),
+                        tool_call_id: None,
+                    },
+                    TaskStatus::Running,
+                )
+                .await
+            {
+                Ok(stored) => stored,
+                Err(error) => {
+                    state.control.unregister(id).await;
+                    return Err(error);
+                }
+            };
+            (id, category, stored, cancel_rx)
+        }
+        None => {
+            let category = TaskRouter::classify(text, &TaskMetadata::default())
+                .as_str()
+                .to_string();
+            let stored = state
+                .task_store
+                .create_with_context(
+                    &category,
+                    ContextEntry {
+                        role: "user".to_string(),
+                        content: text.to_string(),
+                        at: Utc::now(),
+                        tool_call_id: None,
+                    },
+                )
+                .await?;
+            let cancel_rx = state.control.try_register(stored.id).await.ok_or_else(|| {
+                anyhow::anyhow!("новая terminal-задача неожиданно уже выполняется")
+            })?;
+            (stored.id, category, stored, cancel_rx)
+        }
+    };
+
+    // Terminal ждёт и pipeline, и Ctrl+C одновременно. Регистрация сделана
+    // до follow-up mutation и до select, поэтому конкурентный caller не может
+    // заменить sender или дописать второй пользовательский ход.
+    let pipeline = run_task_pipeline_inner(
+        &state.task_store,
+        &state.scheduler,
+        &state.control,
+        &mut cancel_rx,
+        task_id,
+        category,
+        model_override.map(str::to_owned),
+        context_to_messages(&stored.context),
+        allow_manual,
+    );
+    tokio::pin!(pipeline);
+    tokio::pin!(interrupt);
+
+    let signal_result = tokio::select! {
+        biased;
+        signal = &mut interrupt => Some(signal),
+        _ = &mut pipeline => None,
+    };
+
+    if let Some(signal_result) = signal_result {
+        // Сначала фиксируем статус, затем будим тот же cooperative cancellation
+        // path, который использует Control Center. Pipeline дожидается своей
+        // cancellation branch, поэтому cleanup не зависит от drop родителя.
+        let status_result = match &signal_result {
+            Ok(()) => {
+                state
+                    .task_store
+                    .set_status(task_id, TaskStatus::Cancelled)
+                    .await
+            }
+            Err(error) => state
+                .task_store
+                .append_context_and_transition_if_running(
+                    task_id,
+                    ContextEntry {
+                        role: "system".to_string(),
+                        content: format!("Ошибка обработчика Ctrl+C: {error}"),
+                        at: Utc::now(),
+                        tool_call_id: None,
+                    },
+                    TaskStatus::Failed,
+                )
+                .await
+                .map(|_| ()),
+        };
+        let _ = state.control.cancel(task_id).await;
+        pipeline.as_mut().await;
+        state.control.unregister(task_id).await;
+        status_result?;
+
+        return match signal_result {
+            Ok(()) => Ok(TerminalTurnOutcome::Interrupted { task_id }),
+            Err(error) => Err(error.into()),
+        };
+    }
+
+    state.control.unregister(task_id).await;
+
+    let finished = state
+        .task_store
+        .get(task_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("terminal-задача исчезла после выполнения"))?;
+    let reply = finished
+        .context
+        .iter()
+        .rev()
+        .find(|entry| entry.role == "assistant")
+        .map(|entry| entry.content.clone());
+
+    let detail = match finished.status {
+        TaskStatus::Failed | TaskStatus::WaitingForHuman => finished
+            .context
+            .iter()
+            .rev()
+            .find(|entry| entry.role == "system")
+            .map(|entry| entry.content.clone()),
+        _ => None,
+    };
+
+    Ok(TerminalTurnOutcome::Completed(TerminalTurn {
+        task_id: finished.id,
+        status: finished.status,
+        reply,
+        detail,
+    }))
 }
 
 // --- Медиа-пайплайн (Category::Video) ----------------------------------------
@@ -336,6 +599,60 @@ pub const TOOL_REQUEST_ROLE: &str = "tool_request";
 /// по-прежнему собирается только в `tool_gate::approve_by_human`.
 pub const TOOL_APPROVAL_ROLE: &str = "tool_approval";
 
+/// Роль персистентной записи фактического backend/model выбора.
+pub const EXECUTION_METADATA_ROLE: &str = "execution_metadata";
+
+/// Структурированная provenance-информация для API-клиентов.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutionMetadata {
+    pub backend: String,
+    pub model: String,
+}
+
+/// Публичное представление задачи. Хранилище остаётся неизменным: provenance
+/// вычисляется из уже существующей записи контекста при сериализации ответа.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskResponse {
+    #[serde(flatten)]
+    pub task: Task,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionMetadata>,
+}
+
+impl From<Task> for TaskResponse {
+    fn from(task: Task) -> Self {
+        let execution = execution_metadata(&task.context);
+        Self { task, execution }
+    }
+}
+
+/// Разбирает legacy-формат `backend=<name>; model=<name>` без влияния на
+/// старые/повреждённые записи: неполная запись просто не попадает в API.
+fn execution_metadata(context: &[ContextEntry]) -> Option<ExecutionMetadata> {
+    let entry = context
+        .iter()
+        .rev()
+        .find(|entry| entry.role == EXECUTION_METADATA_ROLE)?;
+    let mut backend = None;
+    let mut model = None;
+    for field in entry.content.split(';') {
+        let (key, value) = field.split_once('=')?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        match key.trim() {
+            "backend" => backend = Some(value.to_string()),
+            "model" => model = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some(ExecutionMetadata {
+        backend: backend?,
+        model: model?,
+    })
+}
+
 /// Куда складываются скачанные ассеты.
 ///
 /// Рядом с журналом отправок Telegram (`.kaic/`), по задаче на подкаталог:
@@ -361,7 +678,9 @@ fn media_render_dir(task_id: Uuid) -> std::path::PathBuf {
 ///
 /// Возвращает план и список причин отказа по каждому непринятому ассету:
 /// отказы не проглатываются, они попадают в контекст задачи.
-fn admit_all(entries: Vec<ManifestEntry>) -> Result<(Manifest, Vec<AdmittedAsset>, Vec<String>), String> {
+fn admit_all(
+    entries: Vec<ManifestEntry>,
+) -> Result<(Manifest, Vec<AdmittedAsset>, Vec<String>), String> {
     if entries.is_empty() {
         return Err("источник не вернул ни одного ассета".to_string());
     }
@@ -427,6 +746,7 @@ async fn run_video_pipeline(
     scheduler: Arc<Scheduler>,
     task_id: Uuid,
     messages: &[Message],
+    model_override: Option<&str>,
 ) {
     let Some(raw_text) = media_query(messages) else {
         fail_task(
@@ -438,7 +758,26 @@ async fn run_video_pipeline(
         return;
     };
 
-    let query = extract_search_term(&scheduler, &task_store, task_id, &raw_text).await;
+    let query = match extract_search_term(
+        &scheduler,
+        &task_store,
+        task_id,
+        &raw_text,
+        model_override,
+    )
+    .await
+    {
+        Ok(query) => query,
+        Err(error) => {
+            fail_task(
+                &task_store,
+                task_id,
+                format!("model step failed: {error:#}"),
+            )
+            .await;
+            return;
+        }
+    };
 
     note(
         &task_store,
@@ -482,7 +821,12 @@ async fn run_video_pipeline(
                 .await;
             }
             Err(err) => {
-                fail_task(&task_store, task_id, format!("источник недоступен: {err:#}")).await;
+                fail_task(
+                    &task_store,
+                    task_id,
+                    format!("источник недоступен: {err:#}"),
+                )
+                .await;
                 return;
             }
         }
@@ -613,29 +957,13 @@ async fn run_video_pipeline(
                 rendered.elapsed_ms
             );
 
-            // Путь к результату отдельной записью, машиночитаемо: сводка
-            // выше предназначена человеку, и выкусывать из неё путь регуляркой
-            // означало бы завязать клиента на формат текста.
-            if let Err(err) = task_store
-                .append_context(
-                    task_id,
-                    ContextEntry {
-                        role: ARTIFACT_ROLE.to_string(),
-                        content: rendered.path.to_string_lossy().to_string(),
-                        at: Utc::now(),
-                        tool_call_id: None,
-                    },
-                )
-                .await
-            {
-                tracing::error!("не удалось сохранить путь результата {task_id}: {err:#}");
-            }
-
-            // Тот же порядок, что и в текстовом пайплайне: сначала заявка на
-            // статус, потом роль записи. Видео-задачу отменяют ровно так же,
-            // как текстовую, и результат отменённой не должен выглядеть
-            // ответом.
-            record_outcome(&task_store, task_id, TaskStatus::Done, summary).await;
+            record_artifact_outcome(
+                &task_store,
+                task_id,
+                rendered.path.to_string_lossy().to_string(),
+                summary,
+            )
+            .await;
         }
         // Отказ гейта на всех ассетах — это Failed с внятной причиной, а не
         // паника: задача завершается штатно, причина видна в контексте.
@@ -645,27 +973,32 @@ async fn run_video_pipeline(
 
 /// Превращает свободный текст задачи в поисковый термин силами модели.
 ///
-/// Шаг необязательный по построению: любая неудача — недоступная модель,
-/// пустой или неправдоподобный ответ — возвращает исходный текст дословно,
-/// то есть поведение откатывается к прежнему, а не ломается.
+/// В `auto` этот шаг деградирует к исходному тексту при недоступной extraction-
+/// модели или непригодном ответе. Явно выбранная terminal-модель работает
+/// fail-closed: её backend/model error возвращается пользователю, иначе `/model`
+/// мог бы выглядеть успешным, хотя выбранная модель не запускалась.
 async fn extract_search_term(
     scheduler: &Arc<Scheduler>,
     task_store: &Arc<TaskStore>,
     task_id: Uuid,
     raw_text: &str,
-) -> String {
+    model_override: Option<&str>,
+) -> anyhow::Result<String> {
     let started = std::time::Instant::now();
     let request = media_query_extract::build_request(raw_text);
+    let model = model_override.unwrap_or(media_query_extract::EXTRACTION_MODEL_LABEL);
 
-    let raw = match scheduler
-        .run_with_model(media_query_extract::EXTRACTION_MODEL_LABEL, request)
-        .await
-    {
+    let raw = match scheduler.run_with_model(model, request).await {
         // Инструментов этому шагу не давали, поэтому ответ не-текстом здесь
         // невозможен. Если он всё же придёт — это отказ, а не повод
         // домысливать: шаг по построению деградирующий, берём дословный текст.
         Ok(response) => match response.text() {
             Some(text) => text.to_string(),
+            None if model_override.is_some() => {
+                anyhow::bail!(
+                    "выбранная модель '{model}' вернула tool call вместо поискового термина"
+                );
+            }
             None => {
                 note(
                     task_store,
@@ -675,9 +1008,12 @@ async fn extract_search_term(
                         .to_string(),
                 )
                 .await;
-                return raw_text.to_string();
+                return Ok(raw_text.to_string());
             }
         },
+        Err(err) if model_override.is_some() => {
+            anyhow::bail!("выбранная модель '{model}' недоступна: {err:#}");
+        }
         Err(err) => {
             note(
                 task_store,
@@ -685,9 +1021,21 @@ async fn extract_search_term(
                 format!("извлечение термина не выполнено ({err:#}); ищу по тексту задачи"),
             )
             .await;
-            return raw_text.to_string();
+            return Ok(raw_text.to_string());
         }
     };
+
+    task_store
+        .append_context(
+            task_id,
+            ContextEntry {
+                role: EXECUTION_METADATA_ROLE.to_string(),
+                content: format!("backend={}; model={model}", scheduler.backend_name()),
+                at: Utc::now(),
+                tool_call_id: None,
+            },
+        )
+        .await?;
 
     match media_query_extract::sanitize(&raw) {
         Some(term) => {
@@ -700,7 +1048,10 @@ async fn extract_search_term(
                 ),
             )
             .await;
-            term
+            Ok(term)
+        }
+        None if model_override.is_some() => {
+            anyhow::bail!("выбранная модель '{model}' не дала пригодный поисковый термин");
         }
         None => {
             note(
@@ -709,7 +1060,7 @@ async fn extract_search_term(
                 format!("модель не дала пригодный термин; ищу по тексту задачи «{raw_text}»"),
             )
             .await;
-            raw_text.to_string()
+            Ok(raw_text.to_string())
         }
     }
 }
@@ -776,19 +1127,60 @@ async fn claim_finish(task_store: &Arc<TaskStore>, task_id: Uuid, status: TaskSt
     }
 }
 
-/// Кладёт результат фоновой работы в задачу — ответом, если задача его ещё
-/// ждёт, и помеченной заметкой, если человек успел от неё отказаться.
-///
-/// Молча выбросить результат было бы новым молчаливым отказом — тем самым
-/// классом, который здесь и чинится. Через месяц никто не поймёт, почему GPU
-/// был занят полчаса на отменённой задаче, если от этой работы не осталось
-/// следа. Поэтому текст сохраняется всегда; меняется только его роль.
-///
-/// Роль `system`, а не `assistant`, и это не косметика: Telegram-мост берёт
-/// ПОСЛЕДНЮЮ запись роли `assistant` и отправляет её человеку как ответ.
-/// Результат отменённой задачи, положенный ролью `assistant`, уехал бы в
-/// Telegram как полноценный ответ — то есть отмена снова была бы отменена,
-/// только другим путём.
+/// Атомарно публикует Video artifact, human summary и `Done`.
+/// Если cancellation уже победил, машиночитаемый artifact не записывается,
+/// а поздняя сводка сохраняется только диагностической `system`-заметкой.
+async fn record_artifact_outcome(
+    task_store: &Arc<TaskStore>,
+    task_id: Uuid,
+    artifact_path: String,
+    summary: String,
+) {
+    let now = Utc::now();
+    let entries = vec![
+        ContextEntry {
+            role: ARTIFACT_ROLE.to_string(),
+            content: artifact_path,
+            at: now,
+            tool_call_id: None,
+        },
+        ContextEntry {
+            role: "assistant".to_string(),
+            content: summary.clone(),
+            at: now,
+            tool_call_id: None,
+        },
+    ];
+    match task_store
+        .append_contexts_and_transition_if_running(task_id, entries, TaskStatus::Done)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "задача {task_id}: video result завершился после cancellation; artifact не опубликован"
+            );
+            let late = ContextEntry {
+                role: "system".to_string(),
+                content: format!(
+                    "Работа завершилась уже после того, как задача была отменена или изменена. \
+                     Artifact не опубликован. Ответом задачи этот текст не является:\n\n{summary}"
+                ),
+                at: Utc::now(),
+                tool_call_id: None,
+            };
+            if let Err(err) = task_store.append_context(task_id, late).await {
+                tracing::error!("не удалось сохранить поздний video result {task_id}: {err:#}");
+            }
+        }
+        Err(err) => {
+            tracing::error!("не удалось атомарно сохранить video result {task_id}: {err:#}");
+        }
+    }
+}
+
+/// Кладёт обычный текстовый результат ответом, если задача его ещё ждёт,
+/// либо диагностической `system`-заметкой после cancellation.
 async fn record_outcome(
     task_store: &Arc<TaskStore>,
     task_id: Uuid,
@@ -829,6 +1221,7 @@ async fn record_outcome(
 fn context_to_messages(context: &[ContextEntry]) -> Vec<Message> {
     context
         .iter()
+        .filter(|entry| entry.role != EXECUTION_METADATA_ROLE)
         .map(|entry| match entry.role.as_str() {
             "user" => Message::new(Role::User, entry.content.clone()),
             "assistant" => Message::new(Role::Assistant, entry.content.clone()),
@@ -862,6 +1255,26 @@ fn context_to_messages(context: &[ContextEntry]) -> Vec<Message> {
         .collect()
 }
 
+/// Инструкции, которые входят в каждый локальный agent session по умолчанию.
+/// Они дополняют внешний skill `local-agent-execution`: модель должна реально
+/// использовать встроенные workspace tools, а не описывать воображаемый результат.
+const DEFAULT_LOCAL_AGENT_EXECUTION_INSTRUCTIONS: &str = r#"Режим локального выполнения:
+- Если задача требует создать или изменить файл, реально используй доступные workspace tools. Не выдавай код в ответе вместо записи на диск.
+- Работай по абсолютным или относительным путям, но только вне защищённых системных и секретных каталогов. Не используй `..` и symlink-пути. Если пользователь назвал абсолютный путь, передай его в `path` без изменений: сохрани начальный символ `/`; `home/...` и `/home/...` — разные пути.
+- Для нового файла сначала создай каталог при необходимости, затем создай файл эксклюзивно; не перезаписывай существующие файлы без отдельного разрешения.
+- После создания нового файла перечитай точный целевой файл через `workspace_read_text_file` и проверь содержимое. После создания каталога вызови `workspace_inspect_path`; не пытайся читать каталог как текст.
+- После изменения выполни релевантный тест, сборку или smoke-проверку.
+- Продолжай работу до достижения цели. Не сообщай «создано», «исправлено» или «готово» без подтверждённого read-back и результата проверки.
+- Если нужного инструмента нет или вызов заблокирован, честно сообщи точный блокер и не симулируй выполнение.
+- Не удаляй, не перемещай и не перезаписывай пользовательские файлы без явного разрешения. Не сохраняй секреты; используй [REDACTED]."#;
+
+fn add_default_local_agent_instructions(messages: &mut Vec<Message>) {
+    messages.insert(
+        0,
+        Message::new(Role::System, DEFAULT_LOCAL_AGENT_EXECUTION_INSTRUCTIONS),
+    );
+}
+
 /// Предел шагов цикла «модель → инструмент → модель» на одну задачу.
 ///
 /// Восемь, и число не круглое ради красоты. Замер вызова инструментов
@@ -892,16 +1305,26 @@ async fn run_agent_loop(
     scheduler: &Arc<Scheduler>,
     task_id: Uuid,
     category: &str,
+    model_override: Option<&str>,
     allow_manual: bool,
     mut messages: Vec<Message>,
 ) -> anyhow::Result<LoopOutcome> {
+    add_default_local_agent_instructions(&mut messages);
     let config = McpServerConfig::load(MCP_CONFIG_PATH)?;
-    // Список разрешённых читается из конфига и только оттуда. Пустой список —
-    // подтверждать всё; отсутствие конфига — инструментов нет вовсе.
-    let auto_approve = config
+    // MCP keeps its explicit approval policy. Built-in workspace tools are
+    // separately auto-approved because their implementation is capability-
+    // sandboxed, creates only new entries, and cannot overwrite or delete.
+    let mut auto_approve = config
         .as_ref()
         .map(|c| c.auto_approve.clone())
         .unwrap_or_default();
+    for name in crate::workspace_tools::AUTO_APPROVED_TOOLS {
+        if !auto_approve.iter().any(|approved| approved == name) {
+            auto_approve.push((*name).to_string());
+        }
+    }
+
+    let workspace = crate::workspace_tools::WorkspaceTools::new_anywhere()?;
 
     // Сервер поднимается ДО занятия модели: если он не встанет, незачем
     // держать модель занятой всё время его падения.
@@ -930,32 +1353,67 @@ async fn run_agent_loop(
         .map(|c| c.server_name().to_string())
         .unwrap_or_else(|| "-".to_string());
 
-    let tools = match &mcp {
-        Some(client) => {
-            let tools = client.list_tools().await?;
-            note(
-                task_store,
-                task_id,
-                format!(
-                    "инструменты от '{}': {}. Без подтверждения разрешены: {}",
-                    client.server_name(),
-                    tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
-                    if auto_approve.is_empty() {
-                        "ничего — каждый вызов требует решения человека".to_string()
-                    } else {
-                        auto_approve.join(", ")
-                    }
-                ),
-            )
-            .await;
-            tools
+    let mut tools = crate::workspace_tools::specs();
+    if let Some(client) = &mcp {
+        let mcp_tools = client.list_tools().await?;
+        note(
+            task_store,
+            task_id,
+            format!(
+                "встроенная рабочая область: {}; MCP-инструменты от '{}': {}. Без подтверждения разрешены: {}",
+                crate::workspace_tools::configured_root().display(),
+                client.server_name(),
+                mcp_tools
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                auto_approve.join(", ")
+            ),
+        )
+        .await;
+        // Built-ins own their reserved names; an MCP server cannot shadow
+        // them and redirect a capability-approved call outside the sandbox.
+        for tool in mcp_tools {
+            if !crate::workspace_tools::is_builtin(&tool.name) {
+                tools.push(tool);
+            }
         }
-        None => Vec::new(),
-    };
+    } else {
+        note(
+            task_store,
+            task_id,
+            format!(
+                "доступны встроенные инструменты по файловой системе / (защищённые системные каталоги исключены): {}",
+                crate::workspace_tools::AUTO_APPROVED_TOOLS.join(", ")
+            ),
+        )
+        .await;
+    }
 
     // Сессия, а не `run`: guard обязан пережить все шаги цикла, включая
     // паузы на работу инструмента, иначе модель вытеснят между шагами.
-    let session = scheduler.begin_session(category, allow_manual).await?;
+    let session = match model_override {
+        Some(model) => scheduler.begin_session_with_model(model).await?,
+        None => scheduler.begin_session(category, allow_manual).await?,
+    };
+
+    // Записываем фактический выбор после всех fallback-правил Scheduler'а.
+    task_store
+        .append_context(
+            task_id,
+            ContextEntry {
+                role: EXECUTION_METADATA_ROLE.to_string(),
+                content: format!(
+                    "backend={}; model={}",
+                    scheduler.backend_name(),
+                    session.model()
+                ),
+                at: Utc::now(),
+                tool_call_id: None,
+            },
+        )
+        .await?;
 
     let outcome = agent_steps(
         task_store,
@@ -964,6 +1422,7 @@ async fn run_agent_loop(
         &mut messages,
         &tools,
         mcp.as_ref(),
+        &workspace,
         &auto_approve,
         &server_name,
     )
@@ -988,6 +1447,7 @@ async fn agent_steps(
     messages: &mut Vec<Message>,
     tools: &[crate::model_backend::ToolSpec],
     mcp: Option<&McpClient>,
+    workspace: &crate::workspace_tools::WorkspaceTools,
     auto_approve: &[String],
     server_name: &str,
 ) -> anyhow::Result<LoopOutcome> {
@@ -995,13 +1455,16 @@ async fn agent_steps(
     // модель спросят снова. Иначе она увидела бы собственный запрос без
     // результата и либо повторила бы его, либо получила бы отвергнутую
     // провайдером историю.
-    if let Some(call) = approved_pending_call(&task_store.get(task_id).await?.map(|t| t.context).unwrap_or_default()) {
-        let Some(client) = mcp else {
-            anyhow::bail!("вызов подтверждён, но MCP-сервер недоступен");
-        };
+    if let Some(call) = approved_pending_call(
+        &task_store
+            .get(task_id)
+            .await?
+            .map(|t| t.context)
+            .unwrap_or_default(),
+    ) {
         // Единственный путь человека к `ApprovedToolCall`.
         let approved = crate::tool_gate::approve_by_human(call);
-        let result = execute_tool(task_store, task_id, client, &approved, 0).await;
+        let result = execute_tool(task_store, task_id, mcp, workspace, &approved, 0).await;
         messages.push(Message::tool_result(approved.call().id.clone(), result));
     }
 
@@ -1019,14 +1482,21 @@ async fn agent_steps(
         };
 
         match session.generate(request).await? {
-            GenerateResponse::Text(text) => return Ok(LoopOutcome::Answer(text)),
+            GenerateResponse::Text(text) => {
+                if text.trim().is_empty() {
+                    anyhow::bail!("модель вернула пустой текст");
+                }
+                return Ok(LoopOutcome::Answer(text));
+            }
             GenerateResponse::ToolCalls(calls) => {
-                let Some(client) = mcp else {
-                    anyhow::bail!(
-                        "модель запросила вызов инструмента, но MCP-сервер недоступен"
-                    );
-                };
-
+                for call in &calls {
+                    if !tools.iter().any(|tool| tool.name == call.name) {
+                        anyhow::bail!(
+                            "модель запросила невыданный инструмент '{}' — вызов отклонён",
+                            call.name
+                        );
+                    }
+                }
                 // Реплика ассистента с вызовами обязана лечь в историю ПЕРЕД
                 // результатами: схема требует, чтобы у каждого сообщения роли
                 // `tool` был предшествующий запрос с тем же идентификатором.
@@ -1042,11 +1512,9 @@ async fn agent_steps(
                     match crate::tool_gate::decide(auto_approve, call) {
                         crate::tool_gate::Decision::Approved(approved) => {
                             let result =
-                                execute_tool(task_store, task_id, client, &approved, step).await;
-                            messages.push(Message::tool_result(
-                                approved.call().id.clone(),
-                                result,
-                            ));
+                                execute_tool(task_store, task_id, mcp, workspace, &approved, step)
+                                    .await;
+                            messages.push(Message::tool_result(approved.call().id.clone(), result));
                         }
                         // Разрешения нет — исполнять нечего и нечем: сырой
                         // вызов в точку исполнения не подходит по типу.
@@ -1083,10 +1551,7 @@ fn parse_tool_request(content: &str) -> Option<(String, String)> {
 /// записи роли `tool` с тем же идентификатором — то есть на него ещё не
 /// ответили ни исполнением, ни отказом.
 fn pending_tool_request(context: &[ContextEntry]) -> Option<crate::model_backend::ToolCall> {
-    let request = context
-        .iter()
-        .rev()
-        .find(|e| e.role == TOOL_REQUEST_ROLE)?;
+    let request = context.iter().rev().find(|e| e.role == TOOL_REQUEST_ROLE)?;
     let id = request.tool_call_id.clone()?;
     let already_answered = context
         .iter()
@@ -1110,9 +1575,9 @@ fn pending_tool_request(context: &[ContextEntry]) -> Option<crate::model_backend
 /// тот же подтверждённый вызов на каждом круге.
 fn approved_pending_call(context: &[ContextEntry]) -> Option<crate::model_backend::ToolCall> {
     let call = pending_tool_request(context)?;
-    let approved = context
-        .iter()
-        .any(|e| e.role == TOOL_APPROVAL_ROLE && e.tool_call_id.as_deref() == Some(call.id.as_str()));
+    let approved = context.iter().any(|e| {
+        e.role == TOOL_APPROVAL_ROLE && e.tool_call_id.as_deref() == Some(call.id.as_str())
+    });
     if approved {
         Some(call)
     } else {
@@ -1168,12 +1633,21 @@ async fn park_for_approval(
     server_name: &str,
     call: &crate::model_backend::ToolCall,
 ) -> anyhow::Result<()> {
-    note(
-        task_store,
-        task_id,
-        crate::tool_gate::describe(server_name, call),
-    )
-    .await;
+    let parked = task_store
+        .append_context_and_transition_if_running(
+            task_id,
+            ContextEntry {
+                role: "system".to_string(),
+                content: crate::tool_gate::describe(server_name, call),
+                at: Utc::now(),
+                tool_call_id: None,
+            },
+            TaskStatus::WaitingForHuman,
+        )
+        .await?;
+    if !parked {
+        anyhow::bail!("задача {task_id} была остановлена до ожидания разрешения");
+    }
 
     tracing::info!(
         "задача {task_id}: вызов '{}' ждёт решения человека ({} символов аргументов)",
@@ -1181,9 +1655,6 @@ async fn park_for_approval(
         call.arguments.chars().count()
     );
 
-    task_store
-        .set_status(task_id, TaskStatus::WaitingForHuman)
-        .await?;
     Ok(())
 }
 
@@ -1201,7 +1672,8 @@ async fn park_for_approval(
 async fn execute_tool(
     task_store: &Arc<TaskStore>,
     task_id: Uuid,
-    client: &McpClient,
+    client: Option<&McpClient>,
+    workspace: &crate::workspace_tools::WorkspaceTools,
     approved: &crate::tool_gate::ApprovedToolCall,
     step: usize,
 ) -> String {
@@ -1239,7 +1711,21 @@ async fn execute_tool(
     };
 
     let started = std::time::Instant::now();
-    let (result, outcome) = match client.call_tool(&call.name, arguments).await {
+    let tool_server;
+    let call_result = if crate::workspace_tools::is_builtin(&call.name) {
+        tool_server = "kaic-workspace";
+        workspace.execute(&call.name, &arguments)
+    } else if let Some(client) = client {
+        tool_server = client.server_name();
+        client.call_tool(&call.name, arguments).await
+    } else {
+        tool_server = "unavailable";
+        Err(anyhow::anyhow!(
+            "инструмент '{}' не является встроенным, а MCP-сервер недоступен",
+            call.name
+        ))
+    };
+    let (result, outcome) = match call_result {
         Ok(text) => {
             let failed = text.starts_with("ОШИБКА ИНСТРУМЕНТА");
             let outcome = if failed {
@@ -1261,7 +1747,7 @@ async fn execute_tool(
     if let Err(err) = crate::tool_gate::append_audit(
         crate::tool_gate::AUDIT_LOG_PATH,
         &task_id.to_string(),
-        client.server_name(),
+        tool_server,
         call,
         Some(approved.approved_by()),
         outcome,
@@ -1296,11 +1782,30 @@ async fn execute_tool(
     result
 }
 
+/// Проверяет явный выбор модели на HTTP boundary, до создания задачи.
+fn validate_model_override(
+    registry: &ResourceRegistry,
+    model: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("model должен быть непустым именем модели".to_string());
+    }
+    if registry.get(model).is_none() {
+        return Err(format!("модель '{model}' отсутствует в Resource Registry"));
+    }
+    Ok(Some(model.to_string()))
+}
+
 /// Фоновый пайплайн: Scheduler подбирает и вызывает модель, результат
 /// (или ошибка) дописывается в контекст задачи, статус обновляется.
 /// Используется и при создании задачи, и при её продолжении после
 /// решения пользователя — в обоих случаях на вход идёт полная накопленная
 /// история сообщений, а не только последняя реплика.
+/// Совместимый вызов pipeline для continuation и внутренних callers без override.
 async fn run_task_pipeline(
     task_store: Arc<TaskStore>,
     scheduler: Arc<Scheduler>,
@@ -1310,10 +1815,36 @@ async fn run_task_pipeline(
     messages: Vec<Message>,
     allow_manual: bool,
 ) {
+    run_task_pipeline_with_model(
+        task_store,
+        scheduler,
+        control,
+        task_id,
+        category,
+        None,
+        messages,
+        allow_manual,
+    )
+    .await;
+}
+
+async fn run_task_pipeline_with_model(
+    task_store: Arc<TaskStore>,
+    scheduler: Arc<Scheduler>,
+    control: TaskControl,
+    task_id: Uuid,
+    category: String,
+    model_override: Option<String>,
+    messages: Vec<Message>,
+    allow_manual: bool,
+) {
     // Задача отмечается идущей ДО первого обращения к модели и снимается на
     // любом исходе — иначе `cancel` не нашёл бы кого останавливать, а
     // `continue` считал бы завершённую задачу вечно занятой.
-    let mut cancel_rx = control.register(task_id).await;
+    let Some(mut cancel_rx) = control.try_register(task_id).await else {
+        tracing::warn!("задача {task_id}: второй pipeline не запущен — task ID уже занят");
+        return;
+    };
     run_task_pipeline_inner(
         &task_store,
         &scheduler,
@@ -1321,6 +1852,7 @@ async fn run_task_pipeline(
         &mut cancel_rx,
         task_id,
         category,
+        model_override,
         messages,
         allow_manual,
     )
@@ -1345,6 +1877,7 @@ async fn run_task_pipeline_inner(
     cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
     task_id: Uuid,
     category: String,
+    model_override: Option<String>,
     messages: Vec<Message>,
     allow_manual: bool,
 ) {
@@ -1353,150 +1886,170 @@ async fn run_task_pipeline_inner(
     // категории шли одним путём (текст → модель → текст), и Video ничем не
     // отличалась от Programming, хотя существовала в Router'е.
     //
-    // Video не обращается к модели вообще: медиа-пайплайн — это поиск в
-    // лицензионном источнике, гейт и сборка плана, а не генерация текста.
+    // Video использует отдельный медиа-пайплайн. Его единственный model-step —
+    // извлечение поискового термина; explicit terminal override передаётся туда,
+    // а в auto-режиме сохраняется штатная extraction-модель.
     if category == Category::Video.as_str() {
-        run_video_pipeline(task_store.clone(), scheduler.clone(), task_id, &messages).await;
+        tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel_rx) => {}
+            _ = run_video_pipeline(
+                task_store.clone(),
+                scheduler.clone(),
+                task_id,
+                &messages,
+                model_override.as_deref(),
+            ) => {}
+        }
         return;
     }
 
     let mut messages = messages;
     for followup in 0..=MAX_HUMAN_FOLLOWUPS {
-    // Сколько реплик ЧЕЛОВЕКА в контексте до обращения к модели.
-    //
-    // Считаются только записи роли `user`, а не длина контекста целиком, и это
-    // не придирка: пайплайн пишет в контекст сам — `note()` кладёт список
-    // инструментов, `record_tool_request()` кладёт запрос вызова, отказ кладёт
-    // сообщение роли `tool`. По длине «контекст вырос» выполнялось на любой
-    // задаче с инструментами без всякого участия человека, и цикл
-    // перезапускался до предела, затирая настоящий ответ пустым. Найдено
-    // живым прогоном, а не модульным тестом.
-    let user_turns_before = task_store
-        .get(task_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|t| t.context.iter().filter(|e| e.role == "user").count())
-        .unwrap_or(0);
+        // Сколько реплик ЧЕЛОВЕКА в контексте до обращения к модели.
+        //
+        // Считаются только записи роли `user`, а не длина контекста целиком, и это
+        // не придирка: пайплайн пишет в контекст сам — `note()` кладёт список
+        // инструментов, `record_tool_request()` кладёт запрос вызова, отказ кладёт
+        // сообщение роли `tool`. По длине «контекст вырос» выполнялось на любой
+        // задаче с инструментами без всякого участия человека, и цикл
+        // перезапускался до предела, затирая настоящий ответ пустым. Найдено
+        // живым прогоном, а не модульным тестом.
+        let user_turns_before = task_store
+            .get(task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.context.iter().filter(|e| e.role == "user").count())
+            .unwrap_or(0);
 
-    let started = std::time::Instant::now();
+        let started = std::time::Instant::now();
 
-    // Гонка «работа против отмены». Именно здесь чинится долг: раньше
-    // `run_agent_loop` просто ожидался до конца, и слово `Cancelled` в
-    // хранилище никого не касалось. Проигравшее будущее ДРОПАЕТСЯ, а вместе
-    // с ним — и запрос к модели, и `Session`, держащая `GenerationGuard`.
-    // Поэтому после отмены слот модели освобождается сразу, а не после
-    // естественного конца генерации.
-    let loop_result = tokio::select! {
-        _ = wait_for_cancel(cancel_rx) => {
-            tracing::info!(
-                "задача {task_id} остановлена человеком через {:.1} с — генерация прервана",
-                started.elapsed().as_secs_f64()
-            );
-            return;
-        }
-        outcome = run_agent_loop(task_store, scheduler, task_id, &category, allow_manual, messages.clone()) => outcome,
-    };
+        // Гонка «работа против отмены». Именно здесь чинится долг: раньше
+        // `run_agent_loop` просто ожидался до конца, и слово `Cancelled` в
+        // хранилище никого не касалось. Проигравшее будущее ДРОПАЕТСЯ, а вместе
+        // с ним — и запрос к модели, и `Session`, держащая `GenerationGuard`.
+        // Поэтому после отмены слот модели освобождается сразу, а не после
+        // естественного конца генерации.
+        let loop_result = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel_rx) => {
+                tracing::info!(
+                    "задача {task_id} остановлена человеком через {:.1} с — генерация прервана",
+                    started.elapsed().as_secs_f64()
+                );
+                return;
+            }
+            outcome = run_agent_loop(
+                task_store,
+                scheduler,
+                task_id,
+                &category,
+                model_override.as_deref(),
+                allow_manual,
+                messages.clone(),
+            ) => outcome,
+        };
 
-    match loop_result {
-        // Задача встала на паузу ради решения человека. Статус уже
-        // `WaitingForHuman`, и трогать его нельзя: это не завершение.
-        Ok(LoopOutcome::AwaitingHuman) => {
-            tracing::info!(
-                "задача {task_id} ждёт решения человека по вызову инструмента ({:.1} с работы)",
-                started.elapsed().as_secs_f64()
-            );
-            return;
-        }
-        Ok(LoopOutcome::Answer(response)) => {
-            // Длина ответа, а не ответ: размер полезен для диагностики,
-            // содержимое в лог не идёт.
-            tracing::info!(
-                "задача {task_id} завершена: done за {:.1} с, ответ {} символов",
-                started.elapsed().as_secs_f64(),
-                response.chars().count()
-            );
-            // Статус решается ПЕРВЫМ, до записи ответа: только он говорит,
-            // является ли пришедший текст ответом задачи или результатом
-            // работы, от которой человек успел отказаться. Прежде порядок
-            // был обратным, и ответ ложился ролью `assistant` независимо ни
-            // от чего — то есть отменённая задача получала полноценный
-            // ответ, который Telegram-мост потом и отправлял.
-            let user_turns_after = task_store
-                .get(task_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|t| t.context.iter().filter(|e| e.role == "user").count())
-                .unwrap_or(user_turns_before);
+        match loop_result {
+            // Задача встала на паузу ради решения человека. Статус уже
+            // `WaitingForHuman`, и трогать его нельзя: это не завершение.
+            Ok(LoopOutcome::AwaitingHuman) => {
+                tracing::info!(
+                    "задача {task_id} ждёт решения человека по вызову инструмента ({:.1} с работы)",
+                    started.elapsed().as_secs_f64()
+                );
+                return;
+            }
+            Ok(LoopOutcome::Answer(response)) => {
+                // Длина ответа, а не ответ: размер полезен для диагностики,
+                // содержимое в лог не идёт.
+                tracing::info!(
+                    "задача {task_id} завершена: done за {:.1} с, ответ {} символов",
+                    started.elapsed().as_secs_f64(),
+                    response.chars().count()
+                );
+                // Статус решается ПЕРВЫМ, до записи ответа: только он говорит,
+                // является ли пришедший текст ответом задачи или результатом
+                // работы, от которой человек успел отказаться. Прежде порядок
+                // был обратным, и ответ ложился ролью `assistant` независимо ни
+                // от чего — то есть отменённая задача получала полноценный
+                // ответ, который Telegram-мост потом и отправлял.
+                let user_turns_after = task_store
+                    .get(task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.context.iter().filter(|e| e.role == "user").count())
+                    .unwrap_or(user_turns_before);
 
-            // Пришла ли реплика человека, пока шла генерация? Если да —
-            // задача НЕ закрывается: ответ ложится в контекст, реплика
-            // подхватывается, и следующий шаг делает ТА ЖЕ задача, тем же
-            // пайплайном, последовательно. Второй генерации не заводится —
-            // ровно это и было дефектом: `running_tasks` уходил с 1 на 2.
-            if user_turns_after > user_turns_before && followup < MAX_HUMAN_FOLLOWUPS {
-                let appended = task_store
+                // Пришла ли реплика человека, пока шла генерация? Если да —
+                // задача НЕ закрывается: ответ ложится в контекст, реплика
+                // подхватывается, и следующий шаг делает ТА ЖЕ задача, тем же
+                // пайплайном, последовательно. Второй генерации не заводится —
+                // ровно это и было дефектом: `running_tasks` уходил с 1 на 2.
+                if user_turns_after > user_turns_before && followup < MAX_HUMAN_FOLLOWUPS {
+                    let appended = task_store
+                        .append_context(
+                            task_id,
+                            ContextEntry {
+                                role: "assistant".to_string(),
+                                content: response,
+                                at: Utc::now(),
+                                tool_call_id: None,
+                            },
+                        )
+                        .await;
+                    if let Err(e) = appended {
+                        tracing::error!("не удалось сохранить ответ задачи {task_id}: {e:#}");
+                        return;
+                    }
+                    let Ok(Some(refreshed)) = task_store.get(task_id).await else {
+                        return;
+                    };
+                    tracing::info!(
+                    "задача {task_id}: реплика человека пришла во время работы — продолжаю ТУ ЖЕ задачу, шаг {}",
+                    followup + 2
+                );
+                    messages = context_to_messages(&refreshed.context);
+                    continue;
+                }
+
+                record_outcome(task_store, task_id, TaskStatus::Done, response).await;
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "задача {task_id} завершена: failed за {:.1} с — {err:#}",
+                    started.elapsed().as_secs_f64()
+                );
+                // Причина пишется всегда — она объясняет, чем занималась система,
+                // даже если задачу уже отменили. А вот статус Failed ставится
+                // только если задача его ещё ждёт: отменённая задача не должна
+                // становиться упавшей, человек её не запускал заново.
+                let append_result = task_store
                     .append_context(
                         task_id,
                         ContextEntry {
-                            role: "assistant".to_string(),
-                            content: response,
+                            role: "system".to_string(),
+                            content: format!("Ошибка: {err:#}"),
                             at: Utc::now(),
                             tool_call_id: None,
                         },
                     )
                     .await;
-                if let Err(e) = appended {
-                    tracing::error!("не удалось сохранить ответ задачи {task_id}: {e:#}");
-                    return;
+                if let Err(e) = append_result {
+                    tracing::error!("не удалось сохранить ошибку для задачи {task_id}: {e:#}");
                 }
-                let Ok(Some(refreshed)) = task_store.get(task_id).await else {
-                    return;
-                };
-                tracing::info!(
-                    "задача {task_id}: реплика человека пришла во время работы — продолжаю ТУ ЖЕ задачу, шаг {}",
-                    followup + 2
-                );
-                messages = context_to_messages(&refreshed.context);
-                continue;
-            }
-
-            record_outcome(task_store, task_id, TaskStatus::Done, response).await;
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(
-                "задача {task_id} завершена: failed за {:.1} с — {err:#}",
-                started.elapsed().as_secs_f64()
-            );
-            // Причина пишется всегда — она объясняет, чем занималась система,
-            // даже если задачу уже отменили. А вот статус Failed ставится
-            // только если задача его ещё ждёт: отменённая задача не должна
-            // становиться упавшей, человек её не запускал заново.
-            let append_result = task_store
-                .append_context(
-                    task_id,
-                    ContextEntry {
-                        role: "system".to_string(),
-                        content: format!("Ошибка: {err:#}"),
-                        at: Utc::now(),
-                        tool_call_id: None,
-                    },
-                )
-                .await;
-            if let Err(e) = append_result {
-                tracing::error!("не удалось сохранить ошибку для задачи {task_id}: {e:#}");
-            }
-            if !claim_finish(task_store, task_id, TaskStatus::Failed).await {
-                tracing::warn!(
-                    "задача {task_id}: отказ пришёл после того, как статус сменил человек — \
+                if !claim_finish(task_store, task_id, TaskStatus::Failed).await {
+                    tracing::warn!(
+                        "задача {task_id}: отказ пришёл после того, как статус сменил человек — \
                      решение человека сохранено"
-                );
+                    );
+                }
+                return;
             }
-            return;
         }
-    }
     }
 }
 
@@ -1520,9 +2073,9 @@ async fn wait_for_cancel(rx: &mut tokio::sync::watch::Receiver<bool>) {
 async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Task>, ApiError> {
+) -> Result<Json<TaskResponse>, ApiError> {
     match state.task_store.get(id).await? {
-        Some(task) => Ok(Json(task)),
+        Some(task) => Ok(Json(TaskResponse::from(task))),
         None => Err(ApiError::NotFound),
     }
 }
@@ -1563,7 +2116,10 @@ async fn continue_task(
             .await?;
     }
 
-    state.task_store.set_pending_telegram_message(id, None).await?;
+    state
+        .task_store
+        .set_pending_telegram_message(id, None)
+        .await?;
 
     // Задача уже идёт? Тогда реплика ДОПИСАНА в контекст выше, и этого
     // достаточно: пайплайн подхватит её сам на ближайшей границе шага и
@@ -1584,11 +2140,9 @@ async fn continue_task(
     // Перечитываем задачу — контекст уже включает только что добавленную
     // реплику пользователя, и именно эта полная история идёт в пайплайн,
     // а не только последнее сообщение.
-    let refreshed = state
-        .task_store
-        .get(id)
-        .await?
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("задача исчезла во время продолжения")))?;
+    let refreshed = state.task_store.get(id).await?.ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!("задача исчезла во время продолжения"))
+    })?;
 
     tokio::spawn(run_task_pipeline(
         state.task_store.clone(),
@@ -1638,11 +2192,7 @@ async fn tool_decision(
     Path(id): Path<Uuid>,
     Json(body): Json<ToolDecisionRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let task = state
-        .task_store
-        .get(id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let task = state.task_store.get(id).await?.ok_or(ApiError::NotFound)?;
 
     let Some(call) = pending_tool_request(&task.context) else {
         return Err(ApiError::BadRequest(
@@ -1715,11 +2265,10 @@ async fn tool_decision(
     // Задача возобновляется в обоих случаях: при «да» — чтобы исполнить, при
     // «нет» — чтобы модель увидела отказ и ответила по-человечески.
     state.task_store.set_status(id, TaskStatus::Running).await?;
-    let refreshed = state
-        .task_store
-        .get(id)
-        .await?
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("задача исчезла во время решения")))?;
+    let refreshed =
+        state.task_store.get(id).await?.ok_or_else(|| {
+            ApiError::Internal(anyhow::anyhow!("задача исчезла во время решения"))
+        })?;
 
     tokio::spawn(run_task_pipeline(
         state.task_store.clone(),
@@ -1741,7 +2290,10 @@ async fn cancel_task(
     if state.task_store.get(id).await?.is_none() {
         return Err(ApiError::NotFound);
     }
-    state.task_store.set_status(id, TaskStatus::Cancelled).await?;
+    state
+        .task_store
+        .set_status(id, TaskStatus::Cancelled)
+        .await?;
 
     // Пометка в хранилище — это ЗАПИСЬ о решении, а не его исполнение.
     // Раньше здесь всё и заканчивалось: слово `Cancelled` не читал никто,
@@ -1750,7 +2302,11 @@ async fn cancel_task(
     let was_running = state.control.cancel(id).await;
     tracing::info!(
         "задача {id} отменена человеком; шла в этот момент: {}",
-        if was_running { "да, сигнал послан" } else { "нет" }
+        if was_running {
+            "да, сигнал послан"
+        } else {
+            "нет"
+        }
     );
     Ok(StatusCode::OK)
 }
@@ -1778,7 +2334,8 @@ struct ModelStatusDto {
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<Vec<ModelStatusDto>> {
-    let loaded: HashMap<String, DateTime<Utc>> = state.scheduler.snapshot().await.into_iter().collect();
+    let loaded: HashMap<String, DateTime<Utc>> =
+        state.scheduler.snapshot().await.into_iter().collect();
 
     let models = state
         .resource_registry
@@ -1832,7 +2389,10 @@ async fn set_model_temperature(
         .resource_registry
         .set_temperature(&name, body.temperature)
         .map_err(ApiError::Internal)?;
-    tracing::info!("temperature модели '{name}' изменена на {:?}", body.temperature);
+    tracing::info!(
+        "temperature модели '{name}' изменена на {:?}",
+        body.temperature
+    );
     Ok(list_models(State(state)).await)
 }
 
@@ -1853,6 +2413,28 @@ struct LoadedModelDto {
 
 #[derive(Serialize)]
 struct StatusDto {
+    /// Фактически выбранная реализация ModelBackend.
+    backend: String,
+    /// Конфигурация реализации без секретов, если backend её предоставляет.
+    backend_config: Option<String>,
+    /// Backend runtime health, independent from Scheduler's accounting.
+    backend_healthy: bool,
+    /// Whether the backend runtime was initialized successfully.
+    backend_initialized: bool,
+    /// Names of models resident in the backend right now.
+    backend_loaded_resident_models: Vec<String>,
+    /// Number of resident models (kept explicit for lightweight clients).
+    backend_loaded_resident_model_count: usize,
+    /// Configured llama.cpp GPU offload layer count, when exposed by backend.
+    backend_configured_gpu_layers: Option<u32>,
+    /// Safe llama.cpp device/offload summary, when a loaded model exposes it.
+    backend_device_offload_summary: Option<String>,
+    /// Provider capabilities reported without probing model output.
+    capabilities: crate::model_backend::BackendCapabilities,
+    /// Embedded llama.cpp cannot interrupt a synchronous native decode.
+    cancellation_supported: bool,
+    /// Whether the backend enforces a bounded generation timeout.
+    timeout_supported: bool,
     /// Бюджет памяти под модели (RAM + VRAM минус резерв под ОС), а не
     /// объём видеопамяти — см. константу в main.rs.
     total_model_memory_mb: u32,
@@ -1868,6 +2450,11 @@ struct StatusDto {
     /// Предел, после которого задачи получают отказ.
     max_concurrent_tasks: usize,
     busy_models: Vec<BusyModelDto>,
+    /// `0` is intentional: Scheduler rejects over-capacity work instead of
+    /// queueing it, so there is no hidden queue to report.
+    queue_depth: usize,
+    /// idle, loading, unloading, or generating.
+    inference_state: String,
     /// Что Scheduler делает прямо сейчас, или `null` в покое.
     ///
     /// Без этого поля неблокирующий `/status` был бы честным, но непонятным:
@@ -1898,6 +2485,25 @@ struct ActiveOperationDto {
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusDto> {
+    let backend = state
+        .scheduler
+        .backend_status()
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!("не удалось получить runtime status backend-а: {error:#}");
+            crate::model_backend::BackendStatus {
+                healthy: false,
+                initialized: false,
+                loaded_resident_models: Vec::new(),
+                configured_gpu_layers: None,
+                device_offload_summary: None,
+                capabilities: crate::model_backend::BackendCapabilities {
+                    tool_calling: crate::model_backend::BackendCapability::Unsupported,
+                },
+                cancellation_supported: false,
+                timeout_supported: false,
+            }
+        });
     let loaded = state.scheduler.snapshot().await;
 
     let used_model_memory_mb: u32 = loaded
@@ -1911,13 +2517,16 @@ async fn status(State(state): State<AppState>) -> Json<StatusDto> {
         .map(|(model, last_used)| LoadedModelDto { model, last_used })
         .collect();
 
-    let active_operation = state.scheduler.active_operation().map(|op| ActiveOperationDto {
-        kind: op.kind.to_string(),
-        model: op.model,
-        reason: op.reason,
-        started_at: op.started_at,
-        elapsed_ms: (Utc::now() - op.started_at).num_milliseconds(),
-    });
+    let active_operation = state
+        .scheduler
+        .active_operation()
+        .map(|op| ActiveOperationDto {
+            kind: op.kind.to_string(),
+            model: op.model,
+            reason: op.reason,
+            started_at: op.started_at,
+            elapsed_ms: (Utc::now() - op.started_at).num_milliseconds(),
+        });
 
     let busy_models: Vec<BusyModelDto> = state
         .scheduler
@@ -1926,13 +2535,34 @@ async fn status(State(state): State<AppState>) -> Json<StatusDto> {
         .map(|(model, generations)| BusyModelDto { model, generations })
         .collect();
 
+    let running_tasks = state.scheduler.running_generations();
+    let inference_state = match active_operation.as_ref().map(|op| op.kind.as_str()) {
+        Some("загрузка") => "loading",
+        Some("выгрузка") => "unloading",
+        _ if running_tasks > 0 => "generating",
+        _ => "idle",
+    };
+
     Json(StatusDto {
+        backend: state.scheduler.backend_name().to_string(),
+        backend_config: state.scheduler.backend_config(),
+        backend_healthy: backend.healthy,
+        backend_initialized: backend.initialized,
+        backend_loaded_resident_model_count: backend.loaded_resident_models.len(),
+        backend_loaded_resident_models: backend.loaded_resident_models,
+        backend_configured_gpu_layers: backend.configured_gpu_layers,
+        backend_device_offload_summary: backend.device_offload_summary,
+        capabilities: backend.capabilities,
+        cancellation_supported: backend.cancellation_supported,
+        timeout_supported: backend.timeout_supported,
         total_model_memory_mb: state.scheduler.total_model_memory_mb(),
         used_model_memory_mb,
         loaded_models,
         running_tasks: state.scheduler.running_generations(),
         max_concurrent_tasks: crate::scheduler::MAX_CONCURRENT_TASKS,
         busy_models,
+        queue_depth: 0,
+        inference_state: inference_state.to_string(),
         active_operation,
     })
 }
@@ -1973,6 +2603,36 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use crate::media::provenance::{LicensedProvenance, MediaKind, Provenance};
+
+    #[test]
+    fn every_agent_run_gets_local_execution_instructions_first() {
+        let mut messages = vec![Message::new(Role::User, "создай файл")];
+
+        add_default_local_agent_instructions(&mut messages);
+
+        assert_eq!(messages[0].role, Role::System);
+        assert!(messages[0].content.contains("workspace tools"));
+        assert!(messages[0]
+            .content
+            .contains("После создания нового файла перечитай точный целевой файл"));
+        assert!(messages[0].content.contains("сохрани начальный символ `/`"));
+        assert_eq!(messages[1].role, Role::User);
+    }
+
+    #[test]
+    fn create_task_model_override_is_optional_but_must_be_registered() {
+        let registry = ResourceRegistry::from_file("config/resource_registry.yaml")
+            .expect("resource registry fixture");
+        let known = registry.all().next().expect("at least one model").0.clone();
+
+        assert_eq!(validate_model_override(&registry, None).unwrap(), None);
+        assert_eq!(
+            validate_model_override(&registry, Some(&known)).unwrap(),
+            Some(known)
+        );
+        assert!(validate_model_override(&registry, Some(" ")).is_err());
+        assert!(validate_model_override(&registry, Some("not-in-registry")).is_err());
+    }
 
     fn entry(asset_id: &str, license: &str, attribution: &str) -> ManifestEntry {
         ManifestEntry {
@@ -2023,7 +2683,9 @@ mod tests {
             _request: crate::model_backend::GenerateRequest,
         ) -> anyhow::Result<crate::model_backend::GenerateResponse> {
             tokio::time::sleep(std::time::Duration::from_millis(self.generate_ms)).await;
-            Ok(crate::model_backend::GenerateResponse::Text("ответ модели".to_string()))
+            Ok(crate::model_backend::GenerateResponse::Text(
+                "ответ модели".to_string(),
+            ))
         }
     }
 
@@ -2064,6 +2726,81 @@ mod tests {
         )
     }
 
+    struct TextFakeBackend {
+        generate_ms: u64,
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model_backend::ModelBackend for TextFakeBackend {
+        async fn is_loaded(&self, _model: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn load(&self, _model: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn unload(&self, _model: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn generate(
+            &self,
+            _model: &str,
+            _request: crate::model_backend::GenerateRequest,
+        ) -> anyhow::Result<crate::model_backend::GenerateResponse> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.generate_ms)).await;
+            Ok(crate::model_backend::GenerateResponse::Text(
+                self.text.clone(),
+            ))
+        }
+    }
+
+    fn text_pipeline_fixture(text: &str, generate_ms: u64) -> (AppState, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kaic-text-output-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("resource_registry.yaml"),
+            "Fake:\n  vram_mb: 1000\n  load_seconds: 1\nChosen:\n  vram_mb: 1000\n  load_seconds: 1\nFable9B:\n  vram_mb: 1000\n  load_seconds: 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("capability_registry.yaml"),
+            "Simple:\n  primary: Fake\n",
+        )
+        .unwrap();
+
+        let resource_registry =
+            Arc::new(ResourceRegistry::from_file(dir.join("resource_registry.yaml")).unwrap());
+        let scheduler = Arc::new(Scheduler::new(
+            Arc::new(
+                crate::capability_registry::CapabilityRegistry::from_file(
+                    dir.join("capability_registry.yaml"),
+                )
+                .unwrap(),
+            ),
+            resource_registry.clone(),
+            Arc::new(TextFakeBackend {
+                generate_ms,
+                text: text.to_string(),
+            }),
+            24495,
+        ));
+        (
+            AppState {
+                task_store: Arc::new(TaskStore::new(":memory:").unwrap()),
+                scheduler,
+                resource_registry,
+                control: TaskControl::default(),
+            },
+            dir,
+        )
+    }
+
     async fn status_of(state: &AppState, id: Uuid) -> TaskStatus {
         state
             .task_store
@@ -2072,6 +2809,532 @@ mod tests {
             .expect("задача читается")
             .expect("задача существует")
             .status
+    }
+
+    #[tokio::test]
+    async fn video_artifact_and_answer_publish_atomically_only_for_running_task() {
+        let (state, dir) = text_pipeline_fixture("ответ", 1);
+        let completed = state.task_store.create("Video").await.unwrap();
+        record_artifact_outcome(
+            &state.task_store,
+            completed.id,
+            "/tmp/render.mp4".to_string(),
+            "готово".to_string(),
+        )
+        .await;
+        let completed = state.task_store.get(completed.id).await.unwrap().unwrap();
+        assert_eq!(completed.status, TaskStatus::Done);
+        assert!(completed
+            .context
+            .iter()
+            .any(|entry| entry.role == ARTIFACT_ROLE));
+        assert!(completed
+            .context
+            .iter()
+            .any(|entry| entry.role == "assistant"));
+
+        let cancelled = state.task_store.create("Video").await.unwrap();
+        state
+            .task_store
+            .set_status(cancelled.id, TaskStatus::Cancelled)
+            .await
+            .unwrap();
+        record_artifact_outcome(
+            &state.task_store,
+            cancelled.id,
+            "/tmp/must-not-publish.mp4".to_string(),
+            "поздний результат".to_string(),
+        )
+        .await;
+        let cancelled = state.task_store.get(cancelled.id).await.unwrap().unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert!(!cancelled
+            .context
+            .iter()
+            .any(|entry| entry.role == ARTIFACT_ROLE));
+        assert!(!cancelled
+            .context
+            .iter()
+            .any(|entry| entry.role == "assistant"));
+        assert!(cancelled.context.iter().any(|entry| entry.role == "system"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn status_includes_backend_runtime_metrics() {
+        let (state, dir) = text_pipeline_fixture("ответ", 1);
+        let payload = serde_json::to_value(status(State(state.clone())).await.0)
+            .expect("status response must serialize");
+
+        assert_eq!(payload["backend_healthy"], serde_json::json!(true));
+        assert_eq!(payload["backend_initialized"], serde_json::json!(true));
+        assert_eq!(
+            payload["backend_loaded_resident_models"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            payload["backend_loaded_resident_model_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            payload["backend_configured_gpu_layers"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            payload["backend_device_offload_summary"],
+            serde_json::Value::Null
+        );
+        assert_eq!(payload["cancellation_supported"], serde_json::json!(false));
+        assert_eq!(payload["timeout_supported"], serde_json::json!(false));
+        assert_eq!(payload["queue_depth"], serde_json::json!(0));
+        assert_eq!(payload["inference_state"], serde_json::json!("idle"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn empty_and_whitespace_model_text_fail_instead_of_becoming_answers() {
+        for text in ["", " \n\t "] {
+            let (state, dir) = text_pipeline_fixture(text, 1);
+            let task = state.task_store.create("Simple").await.unwrap();
+
+            run_task_pipeline(
+                state.task_store.clone(),
+                state.scheduler.clone(),
+                state.control.clone(),
+                task.id,
+                "Simple".to_string(),
+                Vec::new(),
+                false,
+            )
+            .await;
+
+            let loaded = state.task_store.get(task.id).await.unwrap().unwrap();
+            assert_eq!(
+                loaded.status,
+                TaskStatus::Failed,
+                "model output {text:?} was accepted as Done"
+            );
+            assert!(
+                loaded.context.iter().all(|entry| entry.role != "assistant"),
+                "empty model output became an assistant answer"
+            );
+            assert!(
+                loaded.context.iter().any(|entry| {
+                    entry.role == "system" && entry.content.contains("модель вернула пустой текст")
+                }),
+                "failure reason does not explain the empty model output"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn non_empty_model_text_still_becomes_the_answer() {
+        let (state, dir) = text_pipeline_fixture("  ответ модели  ", 1);
+        let task = state.task_store.create("Simple").await.unwrap();
+
+        run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            state.control.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        )
+        .await;
+
+        let loaded = state.task_store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Done);
+        assert!(loaded.context.iter().any(|entry| {
+            entry.role == "assistant" && entry.content == "  ответ модели  "
+        }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_uses_the_real_task_pipeline_and_returns_its_answer() {
+        let (state, dir) = text_pipeline_fixture("ответ терминальному пользователю", 1);
+
+        let turn = run_terminal_turn(&state, None, "привет из терминала", false)
+            .await
+            .expect("terminal turn must complete through the task pipeline");
+
+        assert_eq!(turn.status, TaskStatus::Done);
+        assert_eq!(
+            turn.reply.as_deref(),
+            Some("ответ терминальному пользователю")
+        );
+        let stored = state
+            .task_store
+            .get(turn.task_id)
+            .await
+            .unwrap()
+            .expect("terminal task must be persisted");
+        assert!(stored.context.iter().any(|entry| {
+            entry.role == "user" && entry.content == "привет из терминала"
+        }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn terminal_model_override_reaches_the_real_agent_session() {
+        let (state, dir) = text_pipeline_fixture("ответ выбранной модели", 1);
+
+        let outcome = run_terminal_turn_interruptible_with_model(
+            &state,
+            None,
+            "используй выбранную модель",
+            Some("Chosen"),
+            false,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        let TerminalTurnOutcome::Completed(turn) = outcome else {
+            panic!("terminal turn was unexpectedly interrupted");
+        };
+        let stored = state.task_store.get(turn.task_id).await.unwrap().unwrap();
+
+        assert_eq!(execution_metadata(&stored.context).unwrap().model, "Chosen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn terminal_model_override_also_reaches_the_video_model_step() {
+        let (state, dir) = text_pipeline_fixture("зимний лес", 1);
+        let task = state.task_store.create("Video").await.unwrap();
+
+        let term = extract_search_term(
+            &state.scheduler,
+            &state.task_store,
+            task.id,
+            "сделай ролик о зимнем лесе",
+            Some("Chosen"),
+        )
+        .await
+        .unwrap();
+        let loaded: Vec<_> = state
+            .scheduler
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|(model, _)| model)
+            .collect();
+
+        assert_eq!(term, "зимний лес");
+        assert!(loaded.contains(&"Chosen".to_string()));
+        let stored = state.task_store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(execution_metadata(&stored.context).unwrap().model, "Chosen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn auto_video_model_step_keeps_the_extraction_model_and_records_provenance() {
+        let (state, dir) = text_pipeline_fixture("зимний лес", 1);
+        let task = state.task_store.create("Video").await.unwrap();
+
+        let term = extract_search_term(
+            &state.scheduler,
+            &state.task_store,
+            task.id,
+            "сделай ролик о зимнем лесе",
+            None,
+        )
+        .await
+        .unwrap();
+        let stored = state.task_store.get(task.id).await.unwrap().unwrap();
+
+        assert_eq!(term, "зимний лес");
+        assert_eq!(
+            execution_metadata(&stored.context).unwrap().model,
+            media_query_extract::EXTRACTION_MODEL_LABEL
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_cancels_a_video_terminal_turn_without_waiting_for_the_pipeline() {
+        let (state, dir) = text_pipeline_fixture("зимний лес", 5_000);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            run_terminal_turn_interruptible_with_model(
+                &state,
+                None,
+                "сделай видео о зимнем лесе",
+                Some("Chosen"),
+                false,
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("Video cancellation must not wait for the media pipeline")
+        .unwrap();
+        let TerminalTurnOutcome::Interrupted { task_id } = outcome else {
+            panic!("Video turn was not interrupted");
+        };
+
+        assert_eq!(status_of(&state, task_id).await, TaskStatus::Cancelled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unavailable_explicit_video_model_fails_instead_of_silently_falling_back() {
+        let (state, dir) = text_pipeline_fixture("не используется", 1);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            run_terminal_turn_interruptible_with_model(
+                &state,
+                None,
+                "сделай видео о зимнем лесе",
+                Some("Missing"),
+                false,
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("explicit model failure must finish before media network work")
+        .unwrap();
+        let TerminalTurnOutcome::Completed(turn) = outcome else {
+            panic!("turn was unexpectedly interrupted");
+        };
+
+        assert_eq!(turn.status, TaskStatus::Failed);
+        assert!(turn
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Missing"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn task_control_registration_cannot_replace_an_active_pipeline() {
+        let control = TaskControl::default();
+        let task_id = Uuid::new_v4();
+
+        let mut first = control
+            .try_register(task_id)
+            .await
+            .expect("first pipeline must acquire the task");
+        assert!(control.try_register(task_id).await.is_none());
+
+        assert!(control.cancel(task_id).await);
+        first.changed().await.unwrap();
+        assert!(*first.borrow());
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_cannot_be_restored_to_waiting_for_human() {
+        let store = Arc::new(TaskStore::new(":memory:").unwrap());
+        let task = store.create("Simple").await.unwrap();
+        store
+            .set_status(task.id, TaskStatus::Cancelled)
+            .await
+            .unwrap();
+        let call = crate::model_backend::ToolCall {
+            id: "call_cancelled".to_string(),
+            name: "write_file".to_string(),
+            arguments: "{\"path\":\"x\"}".to_string(),
+        };
+
+        let result = park_for_approval(&store, task.id, "filesystem", &call).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            store.get(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_error_releases_registration_and_fails_the_task() {
+        let (state, dir) = text_pipeline_fixture("ответ не должен сохраниться", 5_000);
+
+        let error = match run_terminal_turn_interruptible(
+            &state,
+            None,
+            "вопрос",
+            false,
+            std::future::ready(Err(std::io::Error::other("signal handler failed"))),
+        )
+        .await
+        {
+            Ok(_) => panic!("broken signal future must be reported"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("signal handler failed"));
+
+        let tasks = state.task_store.list().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, TaskStatus::Failed);
+        assert!(!state.control.is_running(tasks[0].id).await);
+        assert!(tasks[0]
+            .context
+            .iter()
+            .all(|entry| entry.role != "assistant"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_cancels_an_in_flight_terminal_turn() {
+        let (state, dir) = text_pipeline_fixture("слишком поздний ответ", 5_000);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            run_terminal_turn_interruptible(&state, None, "долгий вопрос", false, async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok(())
+            }),
+        )
+        .await
+        .expect("Ctrl+C must not wait for model completion")
+        .expect("interrupt handling must succeed");
+
+        let task_id = match outcome {
+            TerminalTurnOutcome::Interrupted { task_id } => task_id,
+            TerminalTurnOutcome::Completed(_) => panic!("slow turn completed before interrupt"),
+        };
+        let stored = state.task_store.get(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Cancelled);
+        assert!(!state.control.is_running(task_id).await);
+        assert!(stored.context.iter().all(|entry| entry.role != "assistant"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn terminal_followup_continues_the_same_persisted_conversation() {
+        let (state, dir) = text_pipeline_fixture("ответ", 1);
+        let first = run_terminal_turn(&state, None, "первый вопрос", false)
+            .await
+            .unwrap();
+
+        let second = run_terminal_turn(&state, Some(first.task_id), "уточнение", false)
+            .await
+            .expect("follow-up must continue the same terminal task");
+
+        assert_eq!(second.task_id, first.task_id);
+        assert_eq!(second.status, TaskStatus::Done);
+        let stored = state.task_store.get(second.task_id).await.unwrap().unwrap();
+        let user_messages = stored
+            .context
+            .iter()
+            .filter(|entry| entry.role == "user")
+            .map(|entry| entry.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(user_messages, vec!["первый вопрос", "уточнение"]);
+        assert_eq!(
+            stored
+                .context
+                .iter()
+                .filter(|entry| entry.role == "assistant")
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_returns_the_pipeline_failure_reason() {
+        let (state, dir) = text_pipeline_fixture("  ", 1);
+
+        let turn = run_terminal_turn(&state, None, "вопрос", false)
+            .await
+            .expect("pipeline failures are terminal results, not transport failures");
+
+        assert_eq!(turn.status, TaskStatus::Failed);
+        assert!(
+            turn.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("модель вернула пустой текст")),
+            "terminal result must expose the stored failure reason"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn terminal_followup_cannot_bypass_a_pending_tool_approval() {
+        let (state, dir) = text_pipeline_fixture("ответ", 1);
+        let task = state.task_store.create("Simple").await.unwrap();
+        state
+            .task_store
+            .set_status(task.id, TaskStatus::WaitingForHuman)
+            .await
+            .unwrap();
+
+        let error = match run_terminal_turn(&state, Some(task.id), "продолжай", false).await
+        {
+            Ok(_) => panic!("waiting task must not accept a normal follow-up"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("ожидает решения по инструменту"));
+        let stored = state.task_store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::WaitingForHuman);
+        assert!(stored.context.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn pause_wins_when_empty_model_text_arrives_after_the_human_decision() {
+        let (state, dir) = text_pipeline_fixture(" \n ", 250);
+        let task = state.task_store.create("Simple").await.unwrap();
+        let pipeline = tokio::spawn(run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            state.control.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let paused = pause_task(State(state.clone()), Path(task.id)).await;
+        assert!(paused.is_ok(), "pause handler rejected an existing task");
+        pipeline.await.unwrap();
+
+        let loaded = state.task_store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Paused);
+        assert!(loaded.context.iter().all(|entry| entry.role != "assistant"));
+        assert!(loaded
+            .context
+            .iter()
+            .any(|entry| entry.content.contains("модель вернула пустой текст")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cancel_wins_while_an_empty_model_response_is_in_flight() {
+        let (state, dir) = text_pipeline_fixture("", 250);
+        let task = state.task_store.create("Simple").await.unwrap();
+        let pipeline = tokio::spawn(run_task_pipeline(
+            state.task_store.clone(),
+            state.scheduler.clone(),
+            state.control.clone(),
+            task.id,
+            "Simple".to_string(),
+            Vec::new(),
+            false,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let cancelled = cancel_task(State(state.clone()), Path(task.id)).await;
+        assert!(
+            cancelled.is_ok(),
+            "cancel handler rejected an existing task"
+        );
+        pipeline.await.unwrap();
+
+        let loaded = state.task_store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Cancelled);
+        assert!(loaded.context.iter().all(|entry| entry.role != "assistant"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Считает обращения к модели. Нужен там, где предмет проверки — СКОЛЬКО
@@ -2109,7 +3372,9 @@ mod tests {
             self.peak.fetch_max(now, SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(self.generate_ms)).await;
             self.in_flight.fetch_sub(1, SeqCst);
-            Ok(crate::model_backend::GenerateResponse::Text("ответ модели".to_string()))
+            Ok(crate::model_backend::GenerateResponse::Text(
+                "ответ модели".to_string(),
+            ))
         }
     }
 
@@ -2120,9 +3385,7 @@ mod tests {
         peak: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    fn counting_fixture(
-        generate_ms: u64,
-    ) -> (AppState, Counters, std::path::PathBuf) {
+    fn counting_fixture(generate_ms: u64) -> (AppState, Counters, std::path::PathBuf) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -2132,14 +3395,22 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let resources = dir.join("resource_registry.yaml");
-        std::fs::write(&resources, "Fake:
+        std::fs::write(
+            &resources,
+            "Fake:
   vram_mb: 1000
   load_seconds: 1
-").unwrap();
+",
+        )
+        .unwrap();
         let capabilities = dir.join("capability_registry.yaml");
-        std::fs::write(&capabilities, "Simple:
+        std::fs::write(
+            &capabilities,
+            "Simple:
   primary: Fake
-").unwrap();
+",
+        )
+        .unwrap();
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2198,7 +3469,10 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let cancelled_at = std::time::Instant::now();
-        if cancel_task(State(state.clone()), Path(task.id)).await.is_err() {
+        if cancel_task(State(state.clone()), Path(task.id))
+            .await
+            .is_err()
+        {
             panic!("обработчик отмены отказал");
         }
 
@@ -2477,9 +3751,7 @@ mod tests {
             _model: &str,
             _request: GenerateRequest,
         ) -> anyhow::Result<GenerateResponse> {
-            let n = self
-                .seen
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(GenerateResponse::ToolCalls(vec![
                 crate::model_backend::ToolCall {
                     id: format!("call_{n}"),
@@ -2490,7 +3762,11 @@ mod tests {
         }
     }
 
-    fn looping_fixture() -> (AppState, std::sync::Arc<std::sync::atomic::AtomicUsize>, std::path::PathBuf) {
+    fn looping_fixture() -> (
+        AppState,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::path::PathBuf,
+    ) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -2504,7 +3780,11 @@ mod tests {
             "Fake:\n  vram_mb: 1000\n  load_seconds: 1\n",
         )
         .unwrap();
-        std::fs::write(dir.join("capability_registry.yaml"), "Simple:\n  primary: Fake\n").unwrap();
+        std::fs::write(
+            dir.join("capability_registry.yaml"),
+            "Simple:\n  primary: Fake\n",
+        )
+        .unwrap();
 
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let resource_registry =
@@ -2540,9 +3820,9 @@ mod tests {
         let (state, seen, dir) = looping_fixture();
         let task = state.task_store.create("Simple").await.unwrap();
 
-        // Инструменты недоступны (конфига MCP нет), поэтому цикл обязан
-        // отказать сразу и назвать причину — это тоже внятный отказ, а не
-        // молчаливый обрыв.
+        // Встроенные инструменты доступны и без MCP, но backend намеренно
+        // запрашивает имя, которого ему не выдавали. Цикл обязан отклонить
+        // такой вызов сразу, до ToolGate и любого исполнителя.
         run_task_pipeline(
             state.task_store.clone(),
             state.scheduler.clone(),
@@ -2563,7 +3843,7 @@ mod tests {
             .find(|e| e.content.starts_with("Ошибка:"))
             .expect("причина обязана быть в контексте задачи");
         assert!(
-            reason.content.contains("MCP-сервер недоступен"),
+            reason.content.contains("невыданный инструмент"),
             "причина не называет, что произошло: {}",
             reason.content
         );
@@ -2606,8 +3886,16 @@ mod tests {
             .await
             .unwrap();
 
-        let found = pending_tool_request(&state.task_store.get(task.id).await.unwrap().unwrap().context)
-            .expect("ожидающий вызов найден");
+        let found = pending_tool_request(
+            &state
+                .task_store
+                .get(task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .context,
+        )
+        .expect("ожидающий вызов найден");
         assert_eq!(found.name, "execute_blender_code");
 
         // Человек отказывает.
@@ -2619,14 +3907,21 @@ mod tests {
         .await;
         assert!(code.is_ok(), "маршрут решения обязан принять отказ");
 
-        let context = state.task_store.get(task.id).await.unwrap().unwrap().context;
+        let context = state
+            .task_store
+            .get(task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .context;
         let refusal = context
             .iter()
             .find(|e| e.role == TOOL_ROLE && e.tool_call_id.as_deref() == Some("call_9"))
             .expect("отказ обязан лечь ролью tool с тем же tool_call_id");
         assert!(
             refusal.content.contains("ОТКАЗАНО ЧЕЛОВЕКОМ"),
-            "модель не поймёт, что это отказ: {}", refusal.content
+            "модель не поймёт, что это отказ: {}",
+            refusal.content
         );
         // После ответа вызов перестаёт быть ожидающим — иначе повторное
         // решение исполнило бы его ещё раз.
@@ -2656,7 +3951,13 @@ mod tests {
             .await
             .unwrap();
 
-        let ctx = state.task_store.get(task.id).await.unwrap().unwrap().context;
+        let ctx = state
+            .task_store
+            .get(task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .context;
         // До решения человека — не подтверждён.
         assert!(approved_pending_call(&ctx).is_none());
 
@@ -2673,8 +3974,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let ctx = state.task_store.get(task.id).await.unwrap().unwrap().context;
-        assert!(approved_pending_call(&ctx).is_some(), "подтверждение не увидено");
+        let ctx = state
+            .task_store
+            .get(task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .context;
+        assert!(
+            approved_pending_call(&ctx).is_some(),
+            "подтверждение не увидено"
+        );
 
         // После исполнения (результат роли tool) — больше не ожидает.
         state
@@ -2690,7 +4000,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let ctx = state.task_store.get(task.id).await.unwrap().unwrap().context;
+        let ctx = state
+            .task_store
+            .get(task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .context;
         assert!(
             approved_pending_call(&ctx).is_none(),
             "подтверждённый вызов исполнился бы на каждом круге"
@@ -2726,10 +4042,96 @@ mod tests {
 
         let messages = context_to_messages(&context);
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1].tool_calls.len(), 1, "запрос вызова не восстановлен");
+        assert_eq!(
+            messages[1].tool_calls.len(),
+            1,
+            "запрос вызова не восстановлен"
+        );
         assert_eq!(messages[1].tool_calls[0].id, "call_3");
         assert_eq!(messages[1].tool_calls[0].name, "get_scene_info");
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_3"));
+    }
+
+    #[test]
+    fn execution_metadata_is_parsed_for_api_clients() {
+        let context = vec![ContextEntry {
+            role: EXECUTION_METADATA_ROLE.to_string(),
+            content: "backend=embedded; model=Fable9B".to_string(),
+            at: Utc::now(),
+            tool_call_id: None,
+        }];
+
+        assert_eq!(
+            execution_metadata(&context),
+            Some(ExecutionMetadata {
+                backend: "embedded".to_string(),
+                model: "Fable9B".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_or_incomplete_execution_metadata_is_omitted() {
+        for content in [
+            "backend=embedded",
+            "model=Fable9B",
+            "backend=; model=Fable9B",
+            "not metadata",
+        ] {
+            let context = vec![ContextEntry {
+                role: EXECUTION_METADATA_ROLE.to_string(),
+                content: content.to_string(),
+                at: Utc::now(),
+                tool_call_id: None,
+            }];
+            assert_eq!(execution_metadata(&context), None, "content: {content}");
+        }
+    }
+
+    #[test]
+    fn task_response_serializes_optional_execution_metadata_without_changing_task_fields() {
+        let task = Task {
+            id: Uuid::nil(),
+            category: "Simple".to_string(),
+            status: TaskStatus::Done,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            context: vec![],
+            pending_telegram_message_id: None,
+        };
+        let response = TaskResponse::from(task.clone());
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["id"], serde_json::json!(Uuid::nil().to_string()));
+        assert!(json.get("execution").is_none());
+
+        let with_metadata = TaskResponse::from(Task {
+            context: vec![ContextEntry {
+                role: EXECUTION_METADATA_ROLE.to_string(),
+                content: "backend=external; model=remote-model".to_string(),
+                at: Utc::now(),
+                tool_call_id: None,
+            }],
+            ..task
+        });
+        assert_eq!(
+            serde_json::to_value(with_metadata).unwrap()["execution"],
+            serde_json::json!({
+                "backend": "external",
+                "model": "remote-model",
+            })
+        );
+    }
+
+    #[test]
+    fn execution_metadata_is_not_sent_to_the_model() {
+        let context = vec![ContextEntry {
+            role: EXECUTION_METADATA_ROLE.to_string(),
+            content: "backend=embedded; model=Fable9B".to_string(),
+            at: Utc::now(),
+            tool_call_id: None,
+        }];
+
+        assert!(context_to_messages(&context).is_empty());
     }
 
     #[test]
@@ -2802,8 +4204,14 @@ mod tests {
         let result = assemble_render_plan(entries);
 
         let reason = result.expect_err("ND-ассеты не могут дать план");
-        assert!(reason.contains("гейт не допустил ни одного"), "причина: {reason}");
-        assert!(reason.contains("ND"), "причина обязана называть ND: {reason}");
+        assert!(
+            reason.contains("гейт не допустил ни одного"),
+            "причина: {reason}"
+        );
+        assert!(
+            reason.contains("ND"),
+            "причина обязана называть ND: {reason}"
+        );
     }
 
     #[test]
@@ -2818,7 +4226,11 @@ mod tests {
         // часть нет. Задача должна выполниться на годных, а отказы —
         // попасть в отчёт, а не потеряться.
         let entries = vec![
-            entry("openverse:good", "by", "\"X\" by Автор is licensed under CC BY 2.0."),
+            entry(
+                "openverse:good",
+                "by",
+                "\"X\" by Автор is licensed under CC BY 2.0.",
+            ),
             entry("openverse:nd", "by-nd", "credit"),
             entry("openverse:pd", "cc0", ""),
         ];

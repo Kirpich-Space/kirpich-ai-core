@@ -54,11 +54,47 @@ const MAX_TERM_WORDS: usize = 3;
 /// «bridge over river» — нормальный термин, и `over` там трогать нельзя.
 const TRAILING_STOPWORDS: &[&str] = &[
     // английский
-    "a", "an", "the", "of", "on", "in", "at", "to", "for", "with", "by",
-    "from", "over", "under", "into", "near", "and", "or",
+    "a",
+    "an",
+    "the",
+    "of",
+    "on",
+    "in",
+    "at",
+    "to",
+    "for",
+    "with",
+    "by",
+    "from",
+    "over",
+    "under",
+    "into",
+    "near",
+    "and",
+    "or",
     // русский
-    "в", "во", "на", "над", "под", "у", "к", "ко", "с", "со", "из", "от",
-    "до", "по", "за", "при", "про", "для", "и", "или", "около", "возле",
+    "в",
+    "во",
+    "на",
+    "над",
+    "под",
+    "у",
+    "к",
+    "ко",
+    "с",
+    "со",
+    "из",
+    "от",
+    "до",
+    "по",
+    "за",
+    "при",
+    "про",
+    "для",
+    "и",
+    "или",
+    "около",
+    "возле",
 ];
 
 /// Снимает служебные слова с конца термина.
@@ -116,10 +152,7 @@ pub fn build_messages(task_text: &str) -> Vec<Message> {
 Без глаголов-команд, без слов «видео», «фото», «сделай». \
 Без кавычек, без пояснений, без точки в конце.",
         ),
-        Message::new(
-            Role::User,
-            format!("Задача: {task_text}\nКлючевые слова:"),
-        ),
+        Message::new(Role::User, format!("Задача: {task_text}\nКлючевые слова:")),
     ]
 }
 
@@ -255,7 +288,10 @@ mod tests {
     fn trailing_preposition_is_stripped_in_both_languages() {
         assert_eq!(strip_trailing_stopwords("снежный лес на"), "снежный лес");
         assert_eq!(strip_trailing_stopwords("старый маяк на"), "старый маяк");
-        assert_eq!(strip_trailing_stopwords("Old lighthouse on"), "Old lighthouse");
+        assert_eq!(
+            strip_trailing_stopwords("Old lighthouse on"),
+            "Old lighthouse"
+        );
         assert_eq!(strip_trailing_stopwords("улица под"), "улица");
     }
 
@@ -263,13 +299,19 @@ mod tests {
     fn meaningful_last_word_is_kept() {
         assert_eq!(strip_trailing_stopwords("mountain lake"), "mountain lake");
         assert_eq!(strip_trailing_stopwords("горное озеро"), "горное озеро");
-        assert_eq!(strip_trailing_stopwords("busy city street"), "busy city street");
+        assert_eq!(
+            strip_trailing_stopwords("busy city street"),
+            "busy city street"
+        );
     }
 
     #[test]
     fn stopword_inside_the_phrase_is_untouched() {
         // «over» в середине — часть смысла, а не мусор обрезки.
-        assert_eq!(strip_trailing_stopwords("bridge over river"), "bridge over river");
+        assert_eq!(
+            strip_trailing_stopwords("bridge over river"),
+            "bridge over river"
+        );
         assert_eq!(strip_trailing_stopwords("дом у моря"), "дом у моря");
     }
 
@@ -303,7 +345,10 @@ mod tests {
 
     #[test]
     fn strips_decoration_models_like_to_add() {
-        assert_eq!(sanitize("\"горное озеро\""), Some("горное озеро".to_string()));
+        assert_eq!(
+            sanitize("\"горное озеро\""),
+            Some("горное озеро".to_string())
+        );
         assert_eq!(sanitize("«горное озеро»"), Some("горное озеро".to_string()));
         assert_eq!(sanitize("- горное озеро"), Some("горное озеро".to_string()));
         assert_eq!(sanitize("горное озеро."), Some("горное озеро".to_string()));
@@ -382,7 +427,9 @@ mod tests {
         let messages = build_messages("сделай видео про горное озеро");
         assert_eq!(messages.len(), 2);
         // Текст задачи попадает в user-сообщение как есть.
-        assert!(messages[1].content.contains("сделай видео про горное озеро"));
+        assert!(messages[1]
+            .content
+            .contains("сделай видео про горное озеро"));
         // Система просит связную фразу и прямо запрещает перечисление
         // синонимов — именно оно давало 0 результатов на живом прогоне
         // («Озеро горы вода»).

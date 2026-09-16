@@ -1,0 +1,9 @@
+KAIC Control Center reliability budget (minutes)
+
+Repository tracing and plan: 20
+UI RED/GREEN and focused verification: 45
+Rust RED/GREEN and race/flow verification: 45
+Full tests and builds: 35
+Linux smoke and cleanup: 25
+README and final report: 20
+Total: 190

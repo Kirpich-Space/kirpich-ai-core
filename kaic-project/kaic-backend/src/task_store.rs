@@ -152,7 +152,37 @@ impl TaskStore {
         let conn = self.conn.clone();
         let task_clone = task.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            insert_task(&conn, &task_clone)
+        })
+        .await
+        .context("паника в фоновом потоке Task Store")??;
+
+        Ok(task)
+    }
+
+    /// Создаёт `Running`-задачу сразу с первой записью контекста.
+    /// Один `INSERT` не может оставить пустую задачу при ошибке сохранения
+    /// пользовательского ввода.
+    pub async fn create_with_context(&self, category: &str, entry: ContextEntry) -> Result<Task> {
+        let task = Task {
+            id: Uuid::new_v4(),
+            category: category.to_string(),
+            status: TaskStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            context: vec![entry],
+            pending_telegram_message_id: None,
+        };
+
+        let conn = self.conn.clone();
+        let task_clone = task.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             insert_task(&conn, &task_clone)
         })
         .await
@@ -192,7 +222,9 @@ impl TaskStore {
     pub async fn get(&self, id: Uuid) -> Result<Option<Task>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<Task>> {
-            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             select_task_by_id(&conn, &id.to_string())
         })
         .await
@@ -200,13 +232,12 @@ impl TaskStore {
     }
 
     /// Ищет задачу, которая ждёт Reply на указанное сообщение Telegram.
-    pub async fn find_by_pending_telegram_message(
-        &self,
-        message_id: i64,
-    ) -> Result<Option<Task>> {
+    pub async fn find_by_pending_telegram_message(&self, message_id: i64) -> Result<Option<Task>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<Task>> {
-            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             select_task_by_pending_message(&conn, message_id)
         })
         .await
@@ -217,7 +248,9 @@ impl TaskStore {
     pub async fn set_status(&self, id: Uuid, status: TaskStatus) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             conn.execute(
                 "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![status.as_str(), Utc::now().to_rfc3339(), id.to_string()],
@@ -257,7 +290,9 @@ impl TaskStore {
     pub async fn finish_if_still_running(&self, id: Uuid, status: TaskStatus) -> Result<bool> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<bool> {
-            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             let changed = conn
                 .execute(
                     "UPDATE tasks SET status = ?1, updated_at = ?2 \
@@ -285,7 +320,9 @@ impl TaskStore {
     ) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             conn.execute(
                 "UPDATE tasks SET pending_telegram_message_id = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![message_id, Utc::now().to_rfc3339(), id.to_string()],
@@ -304,19 +341,115 @@ impl TaskStore {
     pub async fn append_context(&self, id: Uuid, entry: ContextEntry) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = conn.lock().map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
             let mut task = select_task_by_id(&conn, &id.to_string())?
                 .with_context(|| format!("задача {id} не найдена"))?;
             task.context.push(entry);
 
-            let context_yaml =
-                serde_yaml::to_string(&task.context).context("не удалось сериализовать контекст")?;
+            let context_yaml = serde_yaml::to_string(&task.context)
+                .context("не удалось сериализовать контекст")?;
             conn.execute(
                 "UPDATE tasks SET context = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![context_yaml, Utc::now().to_rfc3339(), id.to_string()],
             )
             .context("не удалось сохранить контекст задачи")?;
             Ok(())
+        })
+        .await
+        .context("паника в фоновом потоке Task Store")?
+    }
+
+    /// Атомарно добавляет context entry и меняет статус только пока задача
+    /// остаётся `Running`. Возвращает `false`, если cancellation/pause уже
+    /// победили; их решение при этом не перезаписывается.
+    pub async fn append_context_and_transition_if_running(
+        &self,
+        id: Uuid,
+        entry: ContextEntry,
+        status: TaskStatus,
+    ) -> Result<bool> {
+        self.append_contexts_and_transition_if_running(id, vec![entry], status)
+            .await
+    }
+
+    /// Атомарно добавляет несколько context entries и меняет статус только
+    /// пока задача `Running`. Нужен для результата с отдельным artifact:
+    /// отменённая задача не должна получить даже частично опубликованный
+    /// машиночитаемый результат.
+    pub async fn append_contexts_and_transition_if_running(
+        &self,
+        id: Uuid,
+        entries: Vec<ContextEntry>,
+        status: TaskStatus,
+    ) -> Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let mut task = select_task_by_id(&conn, &id.to_string())?
+                .with_context(|| format!("задача {id} не найдена"))?;
+            task.context.extend(entries);
+            let context_yaml = serde_yaml::to_string(&task.context)
+                .context("не удалось сериализовать контекст")?;
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET context = ?1, status = ?2, updated_at = ?3 \
+                     WHERE id = ?4 AND status = ?5",
+                    rusqlite::params![
+                        context_yaml,
+                        status.as_str(),
+                        Utc::now().to_rfc3339(),
+                        id.to_string(),
+                        TaskStatus::Running.as_str(),
+                    ],
+                )
+                .context("не удалось условно сохранить контекст и статус задачи")?;
+            Ok(changed == 1)
+        })
+        .await
+        .context("паника в фоновом потоке Task Store")?
+    }
+
+    /// Одним SQLite statement добавляет запись контекста и меняет статус.
+    /// Это не оставляет задачу в новом статусе, если сохранение контекста
+    /// завершилось ошибкой.
+    pub async fn append_context_and_set_status(
+        &self,
+        id: Uuid,
+        entry: ContextEntry,
+        status: TaskStatus,
+    ) -> Result<Task> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Task> {
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("TaskStore mutex poisoned: {e}"))?;
+            let mut task = select_task_by_id(&conn, &id.to_string())?
+                .with_context(|| format!("задача {id} не найдена"))?;
+            task.context.push(entry);
+            task.status = status;
+            task.updated_at = Utc::now();
+
+            let context_yaml = serde_yaml::to_string(&task.context)
+                .context("не удалось сериализовать контекст")?;
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET context = ?1, status = ?2, updated_at = ?3 WHERE id = ?4",
+                    rusqlite::params![
+                        context_yaml,
+                        task.status.as_str(),
+                        task.updated_at.to_rfc3339(),
+                        id.to_string(),
+                    ],
+                )
+                .context("не удалось атомарно сохранить контекст и статус задачи")?;
+            if changed != 1 {
+                anyhow::bail!("задача {id} исчезла до сохранения контекста и статуса");
+            }
+            Ok(task)
         })
         .await
         .context("паника в фоновом потоке Task Store")?
@@ -427,6 +560,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_with_context_persists_the_first_turn_atomically() {
+        let store = memory_store().await;
+        let task = store
+            .create_with_context(
+                "Simple",
+                ContextEntry {
+                    role: "user".to_string(),
+                    content: "первый ход".to_string(),
+                    at: Utc::now(),
+                    tool_call_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.context.len(), 1);
+        assert_eq!(task.context[0].content, "первый ход");
+        let loaded = store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.context.len(), 1);
+        assert_eq!(loaded.context[0].role, task.context[0].role);
+        assert_eq!(loaded.context[0].content, task.context[0].content);
+        assert_eq!(loaded.status, TaskStatus::Running);
+    }
+
+    #[tokio::test]
     async fn get_unknown_id_returns_none() {
         let store = memory_store().await;
         assert!(store.get(Uuid::new_v4()).await.unwrap().is_none());
@@ -480,6 +639,45 @@ mod tests {
         assert_eq!(loaded.context.len(), 2);
         assert_eq!(loaded.context[0].content, "Начал монтаж");
         assert_eq!(loaded.context[1].content, "Продолжай");
+    }
+
+    #[tokio::test]
+    async fn context_and_status_transition_roll_back_together() {
+        let store = memory_store().await;
+        let task = store.create("Simple").await.unwrap();
+        store
+            .set_status(task.id, TaskStatus::WaitingForHuman)
+            .await
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_context_change
+                 BEFORE UPDATE OF context ON tasks
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced context failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let result = store
+            .append_context_and_set_status(
+                task.id,
+                ContextEntry {
+                    role: "user".to_string(),
+                    content: "продолжай".to_string(),
+                    at: Utc::now(),
+                    tool_call_id: None,
+                },
+                TaskStatus::Running,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let loaded = store.get(task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::WaitingForHuman);
+        assert!(loaded.context.is_empty());
     }
 
     /// Задача, записанная ДО появления `tool_call_id`, обязана читаться.

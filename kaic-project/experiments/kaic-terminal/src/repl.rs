@@ -2,11 +2,11 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 
+use crate::core::config::Config;
 use crate::core::context::ProjectInfo;
 use crate::core::engine::{ChatMessage, ChatParams, KaicEngine};
-use crate::core::config::Config;
-use crate::{git_diff, git_log, git_show, git_status};
 use crate::tools;
+use crate::{git_diff, git_log, git_show, git_status};
 
 const SYSTEM_PROMPT: &str = "Ты — KAIC, локальный AI-ассистент, работающий в терминале внутри \
 конкретного проекта на диске пользователя. Ты можешь объяснять код, искать ошибки, отвечать по \
@@ -136,7 +136,9 @@ pub fn run(engine: &KaicEngine, config: &Config, project: &ProjectInfo) -> Resul
                 let params = session.params();
                 match engine.chat(&session.history, &params) {
                     Ok(reply) => {
-                        session.history.push(ChatMessage::new("assistant", reply.clone()));
+                        session
+                            .history
+                            .push(ChatMessage::new("assistant", reply.clone()));
                         println!("{reply}\n");
                     }
                     Err(e) => {
@@ -164,7 +166,9 @@ fn handle_read(session: &mut Session, project: &ProjectInfo, rel_path: &str) {
             println!("--- {rel_path} ---\n{content}\n---\n");
             let text = format!("[контекст: {rel_path}]\n{content}");
             session.history.push(ChatMessage::new("user", text));
-            println!("(содержимое добавлено в контекст сессии — модель увидит его в следующем ответе)\n");
+            println!(
+                "(содержимое добавлено в контекст сессии — модель увидит его в следующем ответе)\n"
+            );
         }
         Err(e) => eprintln!("[ошибка] {e:#}\n"),
     }

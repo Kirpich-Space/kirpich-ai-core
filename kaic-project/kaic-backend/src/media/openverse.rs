@@ -162,7 +162,10 @@ mod tests {
         assert!(!parsed.results.is_empty(), "в фикстуре есть результат");
         let first = &parsed.results[0];
         assert_eq!(first.license, "by");
-        assert!(first.attribution.is_some(), "Openverse даёт готовую атрибуцию");
+        assert!(
+            first.attribution.is_some(),
+            "Openverse даёт готовую атрибуцию"
+        );
         assert!(first.url.starts_with("http"));
         assert!(first.foreign_landing_url.starts_with("http"));
     }

@@ -98,6 +98,7 @@ Nemotron:
 # оставляет ~20 GiB запаса, тогда как Nemotron в одиночку занимает 25.12 GiB
 # из ~25.6 GiB доступных — хрупко даже без конкуренции за память.
 Fable9B:
+  path: /mnt/storage/Models/Qwable-9B.gguf
   lm_studio_key: qwable-9b-claude-fable-5-obliterated-i1
   vram_mb: 5734 # 5.60 GiB, полный footprint
   load_seconds: 9
@@ -134,6 +135,7 @@ Fable9B:
 # Планировать латентность по vram_mb по-прежнему нельзя — это ограничение
 # самой метрики, вынесено архитектору отдельным вопросом.
 GPTOSS20:
+  path: /mnt/storage/Models/gpt-oss-20b.gguf
   lm_studio_key: openai/gpt-oss-20b
   # Замер 2026-08-07, `lms load --gpu max --estimate-only`, в LM Studio
   # была загружена Fable9B (5.35 GB) — на оценку это не влияет.
@@ -155,6 +157,43 @@ GPTOSS20:
   # max_context_length — факт из GET /api/v1/models, не оценка.
   context_length: null
   max_context_length: 131072
+  temperature: null
+
+Mistral32_24B:
+  path: /mnt/storage/Models/Mistral_3.2-24B.gguf
+  vram_mb: 14000
+  ram_offload_mb: 14000
+  load_seconds: 25
+  always_loaded: false
+  preferred_device: cpu
+  context_length: 4096
+  max_context_length: 32768
+  temperature: null
+
+# Локальные GGUF, найденные в /mnt/storage/Models. Значения памяти ниже —
+# консервативная оценка: размер файла, округлённый вверх, +10% на runtime.
+# Это не результат живого замера загрузки; модели показываются в selector и
+# фактическая доступность всё равно проверяется backend'ом при запуске.
+Devstral24B:
+  path: /mnt/storage/Models/Devstral-24B.gguf
+  vram_mb: 21809
+  ram_offload_mb: 19826
+  load_seconds: 30
+  always_loaded: false
+  preferred_device: cpu
+  context_length: null
+  max_context_length: null
+  temperature: null
+
+KimiA3B:
+  path: /mnt/storage/Models/Kimi-A3B.gguf
+  vram_mb: 17808
+  ram_offload_mb: 16189
+  load_seconds: 25
+  always_loaded: false
+  preferred_device: cpu
+  context_length: null
+  max_context_length: null
   temperature: null
 
 # --- Модели, которые эта машина не запускает вообще ---
@@ -181,6 +220,7 @@ GPTOSS20:
 # такого влияния нет.
 
 GLM47:
+  path: /mnt/storage/Models/GLM-4.7-Flash.gguf
   lm_studio_key: zai-org/glm-4.7-flash
   vram_mb: 17860 # заявленная потребность, не измерение; не загружается
   load_seconds: 15

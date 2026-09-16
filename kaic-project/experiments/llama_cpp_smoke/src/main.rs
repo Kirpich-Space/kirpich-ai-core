@@ -48,6 +48,30 @@ macro_rules! log_step {
 /// а не тихо выдаст неверный token.
 const EXPECTED_LOGITS_REQUESTS_PER_DECODE: usize = 1;
 
+fn decode_piece(
+    decoder: &mut encoding_rs::Decoder,
+    bytes: &[u8],
+    output: &mut String,
+) {
+    output.reserve(bytes.len() + 3);
+    let _ = decoder.decode_to_string(bytes, output, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_piece;
+
+    #[test]
+    fn decodes_a_split_utf8_piece_without_dropping_text() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut output = String::new();
+        decode_piece(&mut decoder, &[0xD0], &mut output);
+        assert_eq!(output, "");
+        decode_piece(&mut decoder, &[0x9F], &mut output);
+        assert_eq!(output, "П");
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -171,13 +195,12 @@ fn main() -> Result<()> {
         log_step!("[21.{step}] не eog, продолжаем");
 
         log_step!("[BEFORE] model.token_to_bytes(token={token:?})");
-        let bytes = model
-            .token_to_bytes(token, Special::Plaintext)
+        let bytes = model.token_to_raw_bytes(token, Special::Plaintext)
             .context("не удалось получить байты токена")?;
         log_step!("[AFTER] token_to_bytes() успешно, {} байт", bytes.len());
 
         let mut piece = String::new();
-        decoder.decode_to_string(&bytes, &mut piece, false);
+        decode_piece(&mut decoder, &bytes, &mut piece);
         log_step!("[22.{step}] token text = {piece:?}");
 
         log_step!("[23.{step}] batch.clear() и добавляю токен обратно, pos={pos}...");

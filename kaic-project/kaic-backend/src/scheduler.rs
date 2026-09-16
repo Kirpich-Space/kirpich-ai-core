@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use crate::capability_registry::CapabilityRegistry;
-use crate::model_backend::{GenerateRequest, GenerateResponse, ModelBackend};
+use crate::model_backend::{BackendStatus, GenerateRequest, GenerateResponse, ModelBackend};
 use crate::resource_registry::ResourceRegistry;
 
 /// Имя модели, используемое как идентификатор в Model Backend.
@@ -44,7 +44,7 @@ pub type ModelId = String;
 /// Диагностика обязана отвечать ровно то же, что решит Scheduler, — иначе
 /// она начнёт врать, а врущая диагностика хуже её отсутствия.
 fn fits_in_budget(used_mb: u32, needed_mb: u32, budget_mb: u32) -> bool {
-    used_mb + needed_mb <= budget_mb
+    needed_mb <= budget_mb.saturating_sub(used_mb)
 }
 
 /// Хвост строки выбора модели: почему не подошли предыдущие кандидаты.
@@ -147,15 +147,13 @@ pub struct Scheduler {
     current_operation: std::sync::Mutex<Option<ActiveOperation>>,
 
     /// Сколько генераций идёт на каждой модели прямо сейчас.
-    ///
-    /// Появилась вместе с сужением `gpu_lock`. Пока генерация держала лок
-    /// операции, вытеснить используемую модель было невозможно физически —
-    /// второй задачи просто не существовало. Как только генерация вышла
-    /// из-под лока, опасность стала реальной: задача Б выбирает жертвой
-    /// модель, на которой Б в этот момент генерирует, и LM Studio выгружает
-    /// её посреди запроса. Эта таблица — то, что делает такой выбор
-    /// невозможным (см. `pick_eviction_victim`).
     busy: BusyTable,
+
+    /// Admission barrier между началом генерации и изменением набора моделей.
+    /// Читается и меняется только под `busy`: model-management выставляет его
+    /// при нулевом `busy`, а новая генерация отказывается стартовать, пока
+    /// флаг поднят. Это закрывает окно между проверкой и долгим load/evict.
+    model_management: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Сколько задач система обслуживает одновременно.
@@ -174,6 +172,29 @@ pub const MAX_CONCURRENT_TASKS: usize = 2;
 /// `Drop`, а `Drop` не бывает асинхронным. Держится микросекунды и через
 /// `await` не проносится никогда.
 type BusyTable = Arc<std::sync::Mutex<HashMap<ModelId, usize>>>;
+
+/// Поднятый admission barrier снимается даже при cancellation/error.
+struct ModelManagementGuard {
+    active: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+
+impl ModelManagementGuard {
+    fn disarm(mut self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.armed = false;
+    }
+}
+
+impl Drop for ModelManagementGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.active
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
 
 /// Отметка «на этой модели идёт генерация», снимающая себя сама.
 ///
@@ -269,6 +290,7 @@ impl Scheduler {
             loaded: Mutex::new(HashMap::new()),
             current_operation: std::sync::Mutex::new(None),
             busy: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_management: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -363,6 +385,12 @@ impl Scheduler {
     /// бы одновременно увидеть «свободно» и обе пройти.
     fn try_begin_generation(&self, model: &str) -> Option<GenerationGuard> {
         let mut table = self.busy_table();
+        if self
+            .model_management
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
         let running: usize = table.values().sum();
         if running >= MAX_CONCURRENT_TASKS {
             return None;
@@ -375,10 +403,84 @@ impl Scheduler {
         })
     }
 
+    /// Атомарно с admission генераций резервирует окно для load/evict.
+    fn try_begin_model_management(&self) -> Option<ModelManagementGuard> {
+        let table = self.busy_table();
+        if table.values().sum::<usize>() > 0
+            || self
+                .model_management
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        self.model_management
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(table);
+        Some(ModelManagementGuard {
+            active: self.model_management.clone(),
+            armed: true,
+        })
+    }
+
+    /// Одним критическим участком публикует завершение model-management и
+    /// занимает generation slot, не оставляя окна для конкурирующей операции.
+    fn finish_model_management_and_begin_generation(
+        &self,
+        model: &str,
+        management: ModelManagementGuard,
+    ) -> Option<GenerationGuard> {
+        let mut table = self.busy_table();
+        let running: usize = table.values().sum();
+        if running >= MAX_CONCURRENT_TASKS {
+            return None;
+        }
+        *table.entry(model.to_string()).or_insert(0) += 1;
+        management.disarm();
+        drop(table);
+        Some(GenerationGuard {
+            model: model.to_string(),
+            table: self.busy.clone(),
+        })
+    }
+
     /// Бюджет памяти под модели, известный Scheduler'у
     /// (для отображения в Control Center).
     pub fn total_model_memory_mb(&self) -> u32 {
         self.total_model_memory_mb
+    }
+
+    /// Имя фактически выбранной реализации ModelBackend.
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.backend_name()
+    }
+
+    /// Безопасная диагностика фактической конфигурации backend-а.
+    pub fn backend_config(&self) -> Option<String> {
+        self.backend.backend_config()
+    }
+
+    /// Runtime health and resident-model metrics from the actual backend.
+    pub async fn backend_status(&self) -> Result<BackendStatus> {
+        self.backend.runtime_status().await
+    }
+
+    /// Штатно освобождает backend-ресурсы и сбрасывает внутренний учёт.
+    pub async fn shutdown(&self) -> Result<()> {
+        // `run_task_pipeline` запускается отдельно от HTTP handler. Нельзя
+        // выгружать модель, пока generation держит busy-счётчик.
+        loop {
+            let running: usize = self.busy_table().values().sum();
+            if running == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let result = self.backend.shutdown().await;
+        if result.is_ok() {
+            self.loaded.lock().await.clear();
+        }
+        result
     }
 
     /// Что система может при текущем бюджете: какие модели недостижимы,
@@ -585,9 +687,13 @@ impl Scheduler {
 
         for model in self.resource_registry.always_loaded_models() {
             self.begin_operation("загрузка", model, "always_loaded");
+            let resource = self.resource_registry.get(model);
             let outcome = self
                 .backend
-                .load(self.resource_registry.provider_key(model))
+                .load_with_path(
+                    self.resource_registry.provider_key(model),
+                    resource.and_then(|entry| entry.path.as_deref()),
+                )
                 .await;
             self.end_operation();
             outcome
@@ -708,11 +814,16 @@ impl Scheduler {
                 return Err(anyhow!("GPU сейчас занят другой задачей, повторите позже"));
             };
 
+            let management = self
+                .try_begin_model_management()
+                .ok_or_else(|| anyhow!("система занята другой задачей — повторите позже"))?;
             let model_id = match self.select_model(category, allow_manual).await {
                 SchedulerResult::Ready(model_id) => model_id,
                 SchedulerResult::Failed(reason) => return Err(anyhow!(reason)),
             };
-            let Some(guard) = self.try_begin_generation(&model_id) else {
+            let Some(guard) =
+                self.finish_model_management_and_begin_generation(&model_id, management)
+            else {
                 return Err(anyhow!(
                     "предел одновременных задач ({MAX_CONCURRENT_TASKS}) исчерпан"
                 ));
@@ -729,7 +840,11 @@ impl Scheduler {
     ///
     /// Отмечает найденную модель как только что использованную: иначе LRU
     /// считал бы её давно не нужной ровно в тот момент, когда она работает.
-    async fn already_loaded_candidate(&self, category: &str, allow_manual: bool) -> Option<ModelId> {
+    async fn already_loaded_candidate(
+        &self,
+        category: &str,
+        allow_manual: bool,
+    ) -> Option<ModelId> {
         if self.capability_registry.is_manual_only(category) && !allow_manual {
             return None;
         }
@@ -790,20 +905,24 @@ impl Scheduler {
     /// Размещение в памяти идёт по тем же правилам, что и обычный подбор
     /// (`fit_and_load` + LRU), поэтому модель не может занять VRAM в обход
     /// общего учёта.
-    pub async fn run_with_model(
-        &self,
-        model_label: &str,
-        request: GenerateRequest,
-    ) -> Result<GenerateResponse> {
+    /// Открывает многошаговую сессию на явно выбранной модели.
+    /// Размещение, LRU и лимит параллелизма остаются штатными.
+    pub async fn begin_session_with_model(&self, model_label: &str) -> Result<Session<'_>> {
+        let guard = self.acquire_model(model_label).await?;
+        Ok(Session {
+            scheduler: self,
+            model_id: model_label.to_string(),
+            _guard: guard,
+        })
+    }
+
+    async fn acquire_model(&self, model_label: &str) -> Result<GenerationGuard> {
         let Some(resource) = self.resource_registry.get(model_label) else {
             return Err(anyhow!(
                 "модель '{model_label}' отсутствует в Resource Registry"
             ));
         };
 
-        // Правила допуска те же, что у run(): служебный вызов — такая же
-        // генерация и так же обязан отмечаться занятым, иначе его модель
-        // вытеснят из-под него.
         let running = self.running_generations();
         if running >= MAX_CONCURRENT_TASKS {
             return Err(anyhow!(
@@ -812,7 +931,6 @@ impl Scheduler {
             ));
         }
 
-        // Короткая блокировка состояния, затем — размещение уже без неё.
         let already_loaded = {
             let mut loaded = self.loaded.lock().await;
             match loaded.get_mut(model_label) {
@@ -824,36 +942,42 @@ impl Scheduler {
             }
         };
 
-        let guard = if already_loaded {
-            self.try_begin_generation(model_label)
-                .ok_or_else(|| anyhow!("предел одновременных задач ({MAX_CONCURRENT_TASKS})"))?
-        } else {
-            // Размещение меняет набор моделей — исключительный путь, и он
-            // недопустим, пока работает другая задача.
-            if running > 0 {
-                return Err(anyhow!(
-                    "система занята другой задачей, а модель '{model_label}' не загружена \
-                     — повторите позже"
-                ));
-            }
-            let Ok(operation) = self.gpu_lock.try_lock() else {
-                return Err(anyhow!("GPU сейчас занят другой задачей, повторите позже"));
-            };
-            if !self
-                .fit_and_load(model_label, resource.vram_mb, model_label)
-                .await
-            {
-                return Err(anyhow!(
-                    "не удалось разместить модель '{model_label}' в VRAM"
-                ));
-            }
-            let guard = self
+        if already_loaded {
+            return self
                 .try_begin_generation(model_label)
-                .ok_or_else(|| anyhow!("предел одновременных задач ({MAX_CONCURRENT_TASKS})"))?;
-            drop(operation);
-            guard
-        };
+                .ok_or_else(|| anyhow!("предел одновременных задач ({MAX_CONCURRENT_TASKS})"));
+        }
 
+        let Ok(operation) = self.gpu_lock.try_lock() else {
+            return Err(anyhow!("GPU сейчас занят другой задачей, повторите позже"));
+        };
+        let management = self.try_begin_model_management().ok_or_else(|| {
+            anyhow!(
+                "система занята другой задачей, а модель '{model_label}' не загружена \
+                 — повторите позже"
+            )
+        })?;
+        if !self
+            .fit_and_load(model_label, resource.vram_mb, model_label)
+            .await
+        {
+            return Err(anyhow!(
+                "не удалось разместить модель '{model_label}' в VRAM"
+            ));
+        }
+        let guard = self
+            .finish_model_management_and_begin_generation(model_label, management)
+            .ok_or_else(|| anyhow!("предел одновременных задач ({MAX_CONCURRENT_TASKS})"))?;
+        drop(operation);
+        Ok(guard)
+    }
+
+    pub async fn run_with_model(
+        &self,
+        model_label: &str,
+        request: GenerateRequest,
+    ) -> Result<GenerateResponse> {
+        let guard = self.acquire_model(model_label).await?;
         self.generate(model_label, request, guard).await
     }
 
@@ -938,7 +1062,10 @@ impl Scheduler {
             }
             // Кандидат не поместился даже после вытеснения — пробуем следующий
             // по fallback-цепочке, не прерываем весь подбор.
-            rejected.push(format!("{candidate}: не помещается ({} MB)", resource.vram_mb));
+            rejected.push(format!(
+                "{candidate}: не помещается ({} MB)",
+                resource.vram_mb
+            ));
         }
 
         tracing::warn!(
@@ -1001,7 +1128,9 @@ impl Scheduler {
                     self.end_operation();
 
                     if outcome.is_err() {
-                        tracing::warn!("не удалось выгрузить модель '{victim}' для освобождения VRAM");
+                        tracing::warn!(
+                            "не удалось выгрузить модель '{victim}' для освобождения VRAM"
+                        );
                         return false;
                     }
                     self.loaded.lock().await.remove(&victim);
@@ -1079,9 +1208,16 @@ impl Scheduler {
         let started = std::time::Instant::now();
 
         self.begin_operation("загрузка", candidate, reason);
+        let resource_path = self
+            .resource_registry
+            .get(candidate)
+            .and_then(|entry| entry.path.as_deref());
         let outcome = self
             .backend
-            .load(self.resource_registry.provider_key(candidate))
+            .load_with_path(
+                self.resource_registry.provider_key(candidate),
+                resource_path,
+            )
             .await;
         self.end_operation();
 
@@ -1223,7 +1359,10 @@ mod concurrency_tests {
     async fn operation_marker_is_cleared_when_a_load_fails() {
         let (scheduler, dir) = super::budget_tests::scheduler_with_failing_backend(24495);
 
-        assert!(scheduler.active_operation().is_none(), "в покое маркера нет");
+        assert!(
+            scheduler.active_operation().is_none(),
+            "в покое маркера нет"
+        );
 
         let outcome = scheduler.select_model("Heavy", false).await;
         assert!(
@@ -1252,7 +1391,8 @@ mod concurrency_tests {
     /// тянется долгая генерация.
     #[tokio::test]
     async fn two_tasks_on_loaded_models_run_at_the_same_time() {
-        let (scheduler, dir, peak) = super::budget_tests::scheduler_with_slow_generation(24495, 600);
+        let (scheduler, dir, peak) =
+            super::budget_tests::scheduler_with_slow_generation(24495, 600);
         let scheduler = StdArc::new(scheduler);
         // Обе модели уже загружены — набор менять не придётся.
         scheduler.preload_always_loaded().await.unwrap();
@@ -1369,11 +1509,16 @@ mod concurrency_tests {
         }
         assert_eq!(scheduler.busy_models(), vec![("Fits".to_string(), 1)]);
 
-        long.await.unwrap().expect("генерация обязана дойти до конца");
+        long.await
+            .unwrap()
+            .expect("генерация обязана дойти до конца");
 
         // Освободилась — снова кандидат.
         let loaded = scheduler.loaded.lock().await;
-        assert_eq!(scheduler.pick_eviction_victim(&loaded), Some("Fits".to_string()));
+        assert_eq!(
+            scheduler.pick_eviction_victim(&loaded),
+            Some("Fits".to_string())
+        );
         drop(loaded);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1406,7 +1551,9 @@ mod concurrency_tests {
             .iter()
             .any(|(name, _)| name == "Fits"));
 
-        long.await.unwrap().expect("генерация не должна была пострадать");
+        long.await
+            .unwrap()
+            .expect("генерация не должна была пострадать");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1524,7 +1671,11 @@ mod budget_tests {
     pub fn scheduler_with_sleepy_backend(
         budget_mb: u32,
         load_ms: u64,
-    ) -> (Scheduler, PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (
+        Scheduler,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backend = std::sync::Arc::new(SleepyBackend {
             load_ms,
@@ -1598,7 +1749,11 @@ mod budget_tests {
     pub fn scheduler_with_slow_generation(
         budget_mb: u32,
         generate_ms: u64,
-    ) -> (Scheduler, PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (
+        Scheduler,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backend = Arc::new(SlowGenerationBackend {
             generate_ms,
@@ -1703,6 +1858,94 @@ Resident:
         (scheduler, dir)
     }
 
+    #[tokio::test]
+    async fn explicit_model_session_uses_named_resource_not_category_primary() {
+        let (scheduler, dir) = scheduler_with_budget(30_000);
+
+        let session = scheduler
+            .begin_session_with_model("Resident")
+            .await
+            .unwrap();
+
+        assert_eq!(session.model(), "Resident");
+        drop(session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn explicit_load_rechecks_active_generations_after_waiting_on_loaded_state() {
+        let (scheduler, dir) = scheduler_with_budget(30_000);
+        let scheduler = Arc::new(scheduler);
+        let loaded_state = scheduler.loaded.lock().await;
+        let worker = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .acquire_model("Fits")
+                    .await
+                    .map(|guard| drop(guard))
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let active = scheduler
+            .try_begin_generation("Resident")
+            .expect("test generation must acquire a slot");
+        drop(loaded_state);
+
+        let result = worker.await.unwrap();
+        assert!(result.is_err(), "explicit load raced an active generation");
+        drop(active);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn new_generation_cannot_start_after_model_management_admission() {
+        let (scheduler, dir, _peak) = scheduler_with_sleepy_backend(30_000, 100);
+        scheduler.preload_always_loaded().await.unwrap();
+        let scheduler = Arc::new(scheduler);
+        let worker = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.begin_session_with_model("Fits").await.map(drop) })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if scheduler
+                    .active_operation()
+                    .is_some_and(|operation| operation.model == "Fits")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit model load must enter model management");
+
+        let competing = scheduler.begin_session_with_model("Resident").await;
+        assert!(
+            competing.is_err(),
+            "generation started while model management was active"
+        );
+        worker.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn explicit_model_session_rejects_unknown_model() {
+        let (scheduler, dir) = scheduler_with_budget(30_000);
+
+        let error = scheduler
+            .begin_session_with_model("Unknown")
+            .await
+            .err()
+            .expect("unknown model must fail");
+
+        assert!(error.to_string().contains("Resource Registry"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Бюджет 24495 (реальное значение константы): 6000 резидента + 18000
     /// кандидата = 24000 <= 24495.
     #[tokio::test]
@@ -1742,7 +1985,10 @@ Resident:
         let report = scheduler.reachability();
 
         assert_eq!(report.budget_mb, 24495);
-        assert_eq!(report.resident_mb, 6000, "резидент занимает бюджет постоянно");
+        assert_eq!(
+            report.resident_mb, 6000,
+            "резидент занимает бюджет постоянно"
+        );
 
         // 6000 резидента + 26000 = 32000 > 24495 — TooBig недостижим.
         // 6000 + 18000 = 24000 <= 24495 — Fits достижим.
@@ -1769,6 +2015,14 @@ Resident:
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&tight_dir).ok();
+    }
+
+    #[test]
+    fn budget_check_does_not_wrap_on_u32_overflow() {
+        assert!(
+            !fits_in_budget(u32::MAX - 10, 100, u32::MAX),
+            "resource accounting must reject overflowing used + needed"
+        );
     }
 
     /// Тот же кандидат при прежнем бюджете видеопамяти не проходил вообще —

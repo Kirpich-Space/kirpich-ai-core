@@ -22,7 +22,10 @@ impl std::fmt::Display for BuildError {
         match self {
             Self::EmptyTimeline => write!(f, "таймлайн пуст"),
             Self::CreditMissing { asset_id } => {
-                write!(f, "ассет {asset_id} требует атрибуции, но титров для него нет")
+                write!(
+                    f,
+                    "ассет {asset_id} требует атрибуции, но титров для него нет"
+                )
             }
         }
     }
@@ -64,7 +67,10 @@ impl RenderPlan {
         // Титры вжигаются отдельным шагом — не как подсказка плеера, а как
         // часть картинки: файл может уехать куда угодно без метаданных.
         args.push("-vf".to_string());
-        args.push(format!("drawtext=text='{}'", escape_drawtext(&self.credits_text)));
+        args.push(format!(
+            "drawtext=text='{}'",
+            escape_drawtext(&self.credits_text)
+        ));
         args.push(output.to_string());
         args
     }
@@ -191,7 +197,10 @@ mod tests {
             plan.credits_text().contains("Kiwi Tom"),
             "титры обязаны называть автора CC-BY-материала"
         );
-        assert!(plan.ffmpeg_args("out.mp4").iter().any(|a| a.contains("drawtext")));
+        assert!(plan
+            .ffmpeg_args("out.mp4")
+            .iter()
+            .any(|a| a.contains("drawtext")));
     }
 
     #[test]
@@ -217,7 +226,11 @@ mod tests {
             1,
             "один автор — одна строка титров"
         );
-        assert_eq!(plan.asset_ids().len(), 2, "но оба ассета остаются на таймлайне");
+        assert_eq!(
+            plan.asset_ids().len(),
+            2,
+            "но оба ассета остаются на таймлайне"
+        );
     }
 
     #[test]
@@ -239,7 +252,10 @@ mod tests {
 
         let plan = plan_render(&timeline).expect("план собирается");
         let args = plan.ffmpeg_args("out.mp4");
-        let vf = args.iter().find(|a| a.contains("drawtext")).expect("есть drawtext");
+        let vf = args
+            .iter()
+            .find(|a| a.contains("drawtext"))
+            .expect("есть drawtext");
 
         assert!(vf.contains("\\:"), "двоеточие должно быть экранировано");
         assert!(vf.contains("\\'"), "апостроф должен быть экранирован");

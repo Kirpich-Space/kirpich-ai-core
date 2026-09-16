@@ -99,19 +99,35 @@ pub struct DownloadedAsset {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchError {
     /// В манифесте нет URL: материал пользователя лежит локально и не качается.
-    NotDownloadable { asset_id: String },
-    Http { asset_id: String, detail: String },
-    Empty { asset_id: String },
-    TooLarge { asset_id: String, limit: u64 },
+    NotDownloadable {
+        asset_id: String,
+    },
+    Http {
+        asset_id: String,
+        detail: String,
+    },
+    Empty {
+        asset_id: String,
+    },
+    TooLarge {
+        asset_id: String,
+        limit: u64,
+    },
     /// Скачалось что-то, что не является изображением ни одного известного
     /// формата — например HTML-страница ошибки, отданная с кодом 200.
-    NotAnImage { asset_id: String, head: String },
+    NotAnImage {
+        asset_id: String,
+        head: String,
+    },
     /// Манифест заявляет один тип медиа, а скачано другое.
     KindMismatch {
         asset_id: String,
         declared: MediaKind,
     },
-    Io { asset_id: String, detail: String },
+    Io {
+        asset_id: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for FetchError {
@@ -133,7 +149,9 @@ impl std::fmt::Display for FetchError {
                 f,
                 "{asset_id}: манифест заявляет {declared:?}, а скачано изображение"
             ),
-            Self::Io { asset_id, detail } => write!(f, "{asset_id}: не удалось сохранить — {detail}"),
+            Self::Io { asset_id, detail } => {
+                write!(f, "{asset_id}: не удалось сохранить — {detail}")
+            }
         }
     }
 }
@@ -221,7 +239,11 @@ pub async fn fetch_and_verify(
         asset_id: asset_id.clone(),
         detail: e.to_string(),
     })?;
-    let path = target_dir.join(format!("{}.{}", safe_file_stem(&asset_id), format.extension()));
+    let path = target_dir.join(format!(
+        "{}.{}",
+        safe_file_stem(&asset_id),
+        format.extension()
+    ));
     std::fs::write(&path, &body).map_err(|e| FetchError::Io {
         asset_id: asset_id.clone(),
         detail: e.to_string(),
@@ -250,7 +272,13 @@ fn head_hex(bytes: &[u8]) -> String {
 fn safe_file_stem(asset_id: &str) -> String {
     asset_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -295,7 +323,10 @@ mod tests {
 
     #[test]
     fn detects_real_image_signatures() {
-        assert_eq!(detect_image_format(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(ImageFormat::Jpeg));
+        assert_eq!(
+            detect_image_format(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some(ImageFormat::Jpeg)
+        );
         assert_eq!(
             detect_image_format(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
             Some(ImageFormat::Png)
