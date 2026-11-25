@@ -1,0 +1,168 @@
+{
+  "canonical_source": "/home/kirpich/Documents/Кирпич Space Company/Kich.png",
+  "duplicate_source": "/home/kirpich/Загрузки/Kich.png",
+  "sha256": "df5d727a5c713484162de833e9f0dfb46121918492963eb35fbcefc748b93f2a",
+  "bytes": 1410852,
+  "width": 1254,
+  "height": 1254,
+  "bit_depth": 8,
+  "color_type": 2,
+  "transparent": false,
+  "samples": [
+    {
+      "role": "background_corner",
+      "x": 32,
+      "y": 32,
+      "rgb": [
+        254,
+        252,
+        246
+      ],
+      "hex": "#fefcf6"
+    },
+    {
+      "role": "background_top",
+      "x": 627,
+      "y": 100,
+      "rgb": [
+        253,
+        252,
+        247
+      ],
+      "hex": "#fdfcf7"
+    },
+    {
+      "role": "outer_frame",
+      "x": 627,
+      "y": 370,
+      "rgb": [
+        18,
+        17,
+        20
+      ],
+      "hex": "#121114"
+    },
+    {
+      "role": "frame_highlight",
+      "x": 627,
+      "y": 400,
+      "rgb": [
+        67,
+        64,
+        67
+      ],
+      "hex": "#434043"
+    },
+    {
+      "role": "screen",
+      "x": 750,
+      "y": 600,
+      "rgb": [
+        139,
+        135,
+        135
+      ],
+      "hex": "#8b8787"
+    },
+    {
+      "role": "prompt_greater",
+      "x": 515,
+      "y": 558,
+      "rgb": [
+        254,
+        251,
+        243
+      ],
+      "hex": "#fefbf3"
+    },
+    {
+      "role": "prompt_underscore",
+      "x": 665,
+      "y": 674,
+      "rgb": [
+        253,
+        251,
+        244
+      ],
+      "hex": "#fdfbf4"
+    },
+    {
+      "role": "foot",
+      "x": 516,
+      "y": 916,
+      "rgb": [
+        41,
+        41,
+        43
+      ],
+      "hex": "#29292b"
+    },
+    {
+      "role": "ground_shadow",
+      "x": 600,
+      "y": 946,
+      "rgb": [
+        182,
+        171,
+        168
+      ],
+      "hex": "#b6aba8"
+    }
+  ],
+  "top_colors": [
+    {
+      "rgb": [
+        253,
+        252,
+        246
+      ],
+      "count": 214647
+    },
+    {
+      "rgb": [
+        254,
+        252,
+        246
+      ],
+      "count": 198204
+    },
+    {
+      "rgb": [
+        254,
+        253,
+        247
+      ],
+      "count": 134678
+    },
+    {
+      "rgb": [
+        254,
+        252,
+        247
+      ],
+      "count": 74060
+    },
+    {
+      "rgb": [
+        253,
+        251,
+        245
+      ],
+      "count": 67007
+    },
+    {
+      "rgb": [
+        254,
+        253,
+        246
+      ],
+      "count": 66670
+    }
+  ],
+  "reference_id": "kich-df5d727a5c71",
+  "specification_revision": 1,
+  "application_integration_status": "kaic_empty_workspace_integrated_mind_pending_approval",
+  "temporary_usage_copy": "/tmp/kich-integration-dgjytq92/Kich.png",
+  "source_modified": false,
+  "application_copy": "kaic-project/kaic-ui/src/assets/kich/Kich.png"
+}

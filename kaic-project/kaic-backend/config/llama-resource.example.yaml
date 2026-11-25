@@ -1,0 +1,10 @@
+Local:
+  # Должен в точности совпадать с /v1/models id, например --alias local-model.
+  model_id: local-model
+  # ЗАМЕНИТЕ на свой полный footprint модели и KV cache в МиБ.
+  # Ноль намеренно запрещает выполнение, пока оператор не задаст оценку.
+  vram_mb: 0
+  load_seconds: 0
+  always_loaded: true
+  preferred_device: cpu
+  temperature: null

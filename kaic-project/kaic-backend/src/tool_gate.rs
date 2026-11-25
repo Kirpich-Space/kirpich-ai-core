@@ -124,8 +124,8 @@ pub fn describe(server: &str, call: &ToolCall) -> String {
          Сервер: {server}\n\
          Инструмент: {}\n\
          Аргументы ({} символов):\n{}\n\n\
-         Подтвердить: POST /tasks/<id>/tool-decision {{\"approve\": true}}\n\
-         Отказать:    POST /tasks/<id>/tool-decision {{\"approve\": false}}",
+         Подтвердить: POST /tasks/<id>/tool-decision: request_id из pending_tool_approval и approve=true\n\
+         Отказать:    POST /tasks/<id>/tool-decision: тот же request_id и approve=false",
         call.name,
         call.arguments.chars().count(),
         call.arguments
@@ -276,7 +276,10 @@ mod tests {
             panic!("должно было разрешиться");
         };
         assert_eq!(approved.approved_by(), Approval::Allowlist);
-        assert_eq!(approve_by_human(call("что_угодно")).approved_by(), Approval::Human);
+        assert_eq!(
+            approve_by_human(call("что_угодно")).approved_by(),
+            Approval::Human
+        );
     }
 
     #[test]
@@ -290,8 +293,16 @@ mod tests {
         let mut c = call("execute_blender_code");
         c.arguments = "{\"code\":\"import os\\nos.remove('x')\"}".to_string();
 
-        append_audit(&path, "task-1", "BlenderMCP", &c, None, Outcome::DeniedByHuman, "отказ")
-            .unwrap();
+        append_audit(
+            &path,
+            "task-1",
+            "BlenderMCP",
+            &c,
+            None,
+            Outcome::DeniedByHuman,
+            "отказ",
+        )
+        .unwrap();
         append_audit(
             &path,
             "task-1",

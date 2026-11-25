@@ -1,10 +1,9 @@
 //! Model Backend — единая точка входа для работы с LLM.
 //!
 //! Ни Router, ни Capability Registry, ни Scheduler не вызывают модели
-//! напрямую — все обращения идут через trait `ModelBackend`. Сегодня
-//! единственная реализация — LM Studio (через его REST API). Завтра
-//! это может быть llama.cpp server, ONNX Runtime или Candle — ничего
-//! выше этого слоя не заметит разницы.
+//! напрямую — все обращения идут через trait `ModelBackend`. Основной
+//! локальный адаптер — headless llama-server; LM Studio остаётся опциональным.
+//! Wire protocol генерации общий, возможности lifecycle объявляются отдельно.
 //!
 //! Trait умышленно минимален: Scheduler'у нужно знать, загружена ли
 //! модель и уметь её загрузить/выгрузить; Agent'у нужно получить ответ
@@ -172,13 +171,71 @@ impl GenerateResponse {
     }
 }
 
-/// Единый интерфейс для работы с любым источником LLM.
-///
-/// Реализация не обязана быть быстрой или синхронной — все методы
-/// асинхронные, потому что загрузка модели и генерация ответа могут
-/// занимать от секунд до минут (см. Resource Registry).
+/// Подтверждённый отказ до исполнения (например, HTTP 4xx кроме timeout).
+/// Транспортные ошибки и server errors такой гарантии не дают.
+#[derive(Debug)]
+pub(crate) struct ModelOperationRejected(pub String);
+
+impl std::fmt::Display for ModelOperationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ModelOperationRejected {}
+
+fn operation_status_error(error: reqwest::Error) -> anyhow::Error {
+    if error.status().is_some_and(|status| {
+        status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT
+    }) {
+        ModelOperationRejected(error.to_string()).into()
+    } else {
+        error.into()
+    }
+}
+
+/// Идентичность и исходные метаданные модели из discovery провайдера.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredModel {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct BackendInfo {
+    pub name: &'static str,
+    pub externally_managed: bool,
+    pub discovery_supported: bool,
+    pub connected: Option<bool>,
+    pub models: Vec<DiscoveredModel>,
+    pub error: Option<String>,
+}
+
+/// Единый inference-контракт; внешнее управление не выдаётся за load/unload.
 #[async_trait]
 pub trait ModelBackend: Send + Sync {
+    /// Внешний сервер уже держит модель; KAIC не владеет её жизненным циклом.
+    fn externally_managed(&self) -> bool {
+        false
+    }
+
+    fn name(&self) -> &'static str {
+        "unspecified"
+    }
+
+    fn supports_discovery(&self) -> bool {
+        false
+    }
+
+    async fn discover_models(&self) -> Result<Vec<DiscoveredModel>> {
+        anyhow::bail!("этот backend не предоставляет discovery через KAIC")
+    }
+
     /// Проверяет, загружена ли модель прямо сейчас.
     async fn is_loaded(&self, model: &str) -> Result<bool>;
 
@@ -204,6 +261,23 @@ pub trait ModelBackend: Send + Sync {
     /// и тогда чистка просто ничего не найдёт.
     async fn loaded_instances(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    /// Только инстансы, владение которыми подтверждено этим backend.
+    /// Перечисление всех моделей само по себе не устанавливает владение.
+    async fn owned_instances(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Подтвердить устойчивый исход прерванной операции. Обычный снимок
+    /// is_loaded недостаточен: запрос может ещё выполняться удалённо.
+    /// По умолчанию безопасный отказ; backend вправе дать строгую гарантию.
+    async fn reconcile_interrupted_operation(
+        &self,
+        _model: &str,
+        _was_loading: bool,
+    ) -> Result<bool> {
+        anyhow::bail!("backend не может подтвердить исход прерванной операции; проверьте модель у провайдера и перезапустите KAIC")
     }
 
     /// Выгружает конкретный инстанс по его идентификатору.
@@ -285,6 +359,10 @@ impl LmStudioBackend {
 
 #[async_trait]
 impl ModelBackend for LmStudioBackend {
+    fn name(&self) -> &'static str {
+        "lm-studio"
+    }
+
     async fn is_loaded(&self, model: &str) -> Result<bool> {
         let url = format!("{}/api/v1/models", self.base_url);
         let response: ModelsListResponse = self
@@ -313,6 +391,7 @@ impl ModelBackend for LmStudioBackend {
             .await
             .context("не удалось отправить запрос на загрузку модели")?
             .error_for_status()
+            .map_err(operation_status_error)
             .context("LM Studio отказала в загрузке модели")?
             .json()
             .await
@@ -345,7 +424,37 @@ impl ModelBackend for LmStudioBackend {
             .collect())
     }
 
+    async fn owned_instances(&self) -> Result<Vec<String>> {
+        Ok(self.instance_ids.lock().await.values().cloned().collect())
+    }
+
+    async fn reconcile_interrupted_operation(
+        &self,
+        model: &str,
+        was_loading: bool,
+    ) -> Result<bool> {
+        let owned = self.instance_ids.lock().await.get(model).cloned();
+        let Some(instance) = owned else {
+            anyhow::bail!("ответ с instance_id не получен; нельзя присвоить или выгрузить чужой инстанс. Проверьте LM Studio и перезапустите KAIC");
+        };
+        let instances = self.loaded_instances().await?;
+        if was_loading && instances.contains(&instance) {
+            // ID зарегистрирован только после полного успешного ответа load.
+            return Ok(true);
+        }
+        if !instances.contains(&instance) {
+            self.instance_ids.lock().await.remove(model);
+            return Ok(false);
+        }
+        anyhow::bail!(
+            "выгрузка инстанса '{instance}' ещё не подтверждена; повторите проверку позже"
+        )
+    }
+
     async fn unload_instance(&self, instance_id: &str) -> Result<()> {
+        if !self.instance_ids.lock().await.values().any(|id| id == instance_id) {
+            anyhow::bail!("отказ выгружать инстанс '{instance_id}': владение KAIC не подтверждено");
+        }
         let url = format!("{}/api/v1/models/unload", self.base_url);
         self.auth(self.client.post(&url))
             .json(&UnloadRequest { instance_id })
@@ -353,23 +462,15 @@ impl ModelBackend for LmStudioBackend {
             .await
             .context("не удалось отправить запрос на выгрузку инстанса")?
             .error_for_status()
+            .map_err(operation_status_error)
             .context("LM Studio отказала в выгрузке инстанса")?;
+        self.instance_ids.lock().await.retain(|_, id| id != instance_id);
         Ok(())
     }
 
     async fn unload(&self, model: &str) -> Result<()> {
-        // instance_id, который вернула LM Studio при загрузке — не обязан
-        // совпадать с ключом модели (см. документацию). Если по какой-то
-        // причине мы не отслеживали эту модель (например, она была
-        // загружена не через этот backend), используем имя модели как
-        // разумный fallback — так вело себя исходное упрощённое поведение.
-        let instance_id = self
-            .instance_ids
-            .lock()
-            .await
-            .get(model)
-            .cloned()
-            .unwrap_or_else(|| model.to_string());
+        let instance_id = self.instance_ids.lock().await.get(model).cloned()
+            .with_context(|| format!("отказ выгружать модель '{model}': владение KAIC не подтверждено"))?;
 
         let url = format!("{}/api/v1/models/unload", self.base_url);
         self.auth(self.client.post(&url))
@@ -380,6 +481,7 @@ impl ModelBackend for LmStudioBackend {
             .await
             .context("не удалось отправить запрос на выгрузку модели")?
             .error_for_status()
+            .map_err(operation_status_error)
             .context("LM Studio отказала в выгрузке модели")?;
 
         self.instance_ids.lock().await.remove(model);
@@ -388,108 +490,120 @@ impl ModelBackend for LmStudioBackend {
 
     async fn generate(&self, model: &str, request: GenerateRequest) -> Result<GenerateResponse> {
         let url = format!("{}/v1/chat/completions", self.base_url);
-
-        let messages: Vec<WireMessage> = request
-            .messages
-            .iter()
-            .map(|m| WireMessage {
-                role: m.role.as_wire_str(),
-                content: &m.content,
-                tool_call_id: m.tool_call_id.as_deref(),
-                tool_calls: if m.tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(
-                        m.tool_calls
-                            .iter()
-                            .map(|c| WireToolCallOut {
-                                id: &c.id,
-                                kind: "function",
-                                function: WireToolCallFunctionOut {
-                                    name: &c.name,
-                                    arguments: &c.arguments,
-                                },
-                            })
-                            .collect(),
-                    )
-                },
-            })
-            .collect();
-
-        // Пустой список инструментов означает «инструментов нет», а не
-        // «инструментов ноль»: поле обязано исчезнуть из JSON целиком, иначе
-        // прежние запросы перестали бы быть прежними. То же свойство и та же
-        // причина, что у `temperature`.
-        let tools: Vec<WireTool> = request
-            .tools
-            .iter()
-            .map(|t| WireTool {
-                kind: "function",
-                function: WireFunction {
-                    name: &t.name,
-                    description: &t.description,
-                    parameters: &t.input_schema,
-                },
-            })
-            .collect();
-
-        let body = ChatCompletionsRequest {
-            model,
-            messages,
-            temperature: request.temperature,
-            tools: if tools.is_empty() { None } else { Some(tools) },
-        };
-
-        let response: ChatCompletionsResponse = self
-            .auth(self.client.post(&url))
-            .json(&body)
-            .send()
-            .await
-            .context("не удалось отправить запрос на генерацию")?
-            .error_for_status()
-            .context("LM Studio вернула ошибку при генерации ответа")?
-            .json()
-            .await
-            .context("не удалось разобрать ответ LM Studio")?;
-
-        // Пустой `choices` — это НЕ ответ пустой строкой, а несостоявшийся
-        // ответ: провайдер обязан вернуть хотя бы один вариант. Раньше здесь
-        // стоял `unwrap_or_default()`, и разница стиралась молча — задача
-        // уходила в Done с пустым сообщением ассистента, а медиа-контур
-        // тихо сползал на дословный текст задачи. Механизм работал, отказ
-        // был не виден: тот же сюжет, что с `decode_to_string` в
-        // kaic-terminal, писавшим в `String` нулевой ёмкости.
-        //
-        // Граница намеренная: пустая СТРОКА внутри присутствующего варианта
-        // остаётся `Ok`. Это ответ, пусть и бессодержательный — провайдер
-        // своё обещание выполнил, а «модель ничего не сказала» решается не
-        // здесь.
-        let message = response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .context("LM Studio вернула ответ без вариантов (пустой choices)")?;
-
-        // Просьба вызвать инструменты важнее текста: при `tool_calls` модели
-        // кладут в `content` либо пустоту, либо рассуждение вслух, и принять
-        // его за ответ значило бы оборвать цикл на первом же шаге.
-        let calls = message.tool_calls.unwrap_or_default();
-        if !calls.is_empty() {
-            return Ok(GenerateResponse::ToolCalls(
-                calls
-                    .into_iter()
-                    .map(|c| ToolCall {
-                        id: c.id,
-                        name: c.function.name,
-                        arguments: c.function.arguments,
-                    })
-                    .collect(),
-            ));
-        }
-
-        Ok(GenerateResponse::Text(message.content.unwrap_or_default()))
+        generate_openai(self.auth(self.client.post(&url)), model, request).await
     }
+}
+
+/// Общий OpenAI-compatible wire protocol без операций жизненного цикла.
+pub(crate) async fn generate_openai(
+    builder: reqwest::RequestBuilder,
+    model: &str,
+    request: GenerateRequest,
+) -> Result<GenerateResponse> {
+    let messages: Vec<WireMessage> = request
+        .messages
+        .iter()
+        .map(|m| WireMessage {
+            role: m.role.as_wire_str(),
+            content: &m.content,
+            tool_call_id: m.tool_call_id.as_deref(),
+            tool_calls: if m.tool_calls.is_empty() {
+                None
+            } else {
+                Some(
+                    m.tool_calls
+                        .iter()
+                        .map(|c| WireToolCallOut {
+                            id: &c.id,
+                            kind: "function",
+                            function: WireToolCallFunctionOut {
+                                name: &c.name,
+                                arguments: &c.arguments,
+                            },
+                        })
+                        .collect(),
+                )
+            },
+        })
+        .collect();
+
+    // Пустой список инструментов означает «инструментов нет», а не
+    // «инструментов ноль»: поле обязано исчезнуть из JSON целиком, иначе
+    // прежние запросы перестали бы быть прежними. То же свойство и та же
+    // причина, что у `temperature`.
+    let tools: Vec<WireTool> = request
+        .tools
+        .iter()
+        .map(|t| WireTool {
+            kind: "function",
+            function: WireFunction {
+                name: &t.name,
+                description: &t.description,
+                parameters: &t.input_schema,
+            },
+        })
+        .collect();
+
+    let body = ChatCompletionsRequest {
+        model,
+        messages,
+        temperature: request.temperature,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+    };
+
+    let response: ChatCompletionsResponse = builder
+        .json(&body)
+        .send()
+        .await
+        .context("не удалось отправить запрос на генерацию")?
+        .error_for_status()
+        .context("inference backend вернул ошибку при генерации ответа")?
+        .json()
+        .await
+        .context("не удалось разобрать ответ inference backend")?;
+
+    // Пустой `choices` — это НЕ ответ пустой строкой, а несостоявшийся
+    // ответ: провайдер обязан вернуть хотя бы один вариант. Раньше здесь
+    // стоял `unwrap_or_default()`, и разница стиралась молча — задача
+    // уходила в Done с пустым сообщением ассистента, а медиа-контур
+    // тихо сползал на дословный текст задачи. Механизм работал, отказ
+    // был не виден: тот же сюжет, что с `decode_to_string` в
+    // kaic-terminal, писавшим в `String` нулевой ёмкости.
+    //
+    // Граница намеренная: пустая СТРОКА внутри присутствующего варианта
+    // остаётся `Ok`. Это ответ, пусть и бессодержательный — провайдер
+    // своё обещание выполнил, а «модель ничего не сказала» решается не
+    // здесь.
+    let message = response
+        .choices
+        .into_iter()
+        .next()
+        .map(|c| c.message)
+        .context("inference backend вернул ответ без вариантов (пустой choices)")?;
+
+    // Просьба вызвать инструменты важнее текста: при `tool_calls` модели
+    // кладут в `content` либо пустоту, либо рассуждение вслух, и принять
+    // его за ответ значило бы оборвать цикл на первом же шаге.
+    let calls = message.tool_calls.unwrap_or_default();
+    if !calls.is_empty() {
+        return Ok(GenerateResponse::ToolCalls(
+            calls
+                .into_iter()
+                .map(|c| ToolCall {
+                    id: c.id,
+                    name: c.function.name,
+                    arguments: c.function.arguments,
+                })
+                .collect(),
+        ));
+    }
+
+    // null/отсутствие content без tool_calls не содержит ни одного из
+    // допустимых вариантов ответа. Явная пустая строка остаётся допустимой.
+    let text = message.content.context(
+        "inference backend вернул сообщение, которое не содержит текста или вызовов инструментов",
+    )?;
+    Ok(GenerateResponse::Text(text))
 }
 
 // --- Формы запросов/ответов LM Studio REST API ---
@@ -867,7 +981,10 @@ mod timeout_tests {
         // задачи как «Ошибка: {текст}» и читается человеком. Общее
         // «ошибка генерации» было бы тем же молчаливым отказом, только с
         // другим лицом.
-        assert_eq!(text, "LM Studio вернула ответ без вариантов (пустой choices)");
+        assert_eq!(
+            text,
+            "inference backend вернул ответ без вариантов (пустой choices)"
+        );
 
         server.abort();
     }
@@ -993,4 +1110,37 @@ struct WireToolCallFunction {
     /// строку, и разбирать её здесь значило бы уронить весь ответ из-за
     /// одного кривого аргумента.
     arguments: String,
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unowned_model_or_instance_is_rejected_before_network_access() {
+        let backend = LmStudioBackend::new("http://127.0.0.1:1", None);
+        assert!(backend
+            .unload("other-client")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("владение"));
+        assert!(backend
+            .unload_instance("other-client")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("владение"));
+        assert!(backend.owned_instances().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_load_without_response_id_is_not_adopted_from_shared_backend() {
+        let backend = LmStudioBackend::new("http://127.0.0.1:1", None);
+        let error = backend
+            .reconcile_interrupted_operation("model", true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("instance_id"));
+    }
 }

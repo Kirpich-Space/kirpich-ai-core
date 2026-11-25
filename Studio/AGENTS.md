@@ -1,0 +1,1 @@
+Only this new project is writable. Never read/copy existing Documents repositories, credentials or private data. No sudo, deletion, commits, pushes or changes to running model jobs. Original new Rust code only. Read BUILD_BRIEF.md.

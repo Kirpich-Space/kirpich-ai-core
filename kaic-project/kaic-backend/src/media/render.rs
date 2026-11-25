@@ -28,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tokio::{io::AsyncReadExt, process::Command, sync::watch};
 
 use super::fetch::DownloadedAsset;
 
@@ -52,6 +53,7 @@ const OUTPUT_FPS: u32 = 30;
 /// ролик, и загруженную машину, и при этом не дающий зависшему процессу
 /// держать задачу бесконечно.
 pub const RENDER_TIMEOUT: Duration = Duration::from_secs(300);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Шрифт для титров.
 ///
@@ -73,14 +75,23 @@ pub enum RenderError {
     NoInputs,
     Spawn(String),
     /// ffmpeg отработал, но вернул ненулевой код.
-    Failed { code: Option<i32>, stderr_tail: String },
-    TimedOut { seconds: u64 },
+    Failed {
+        code: Option<i32>,
+        stderr_tail: String,
+    },
+    TimedOut {
+        seconds: u64,
+    },
+    /// Pause и cancel завершают текущий процесс; продолжение запускает этап заново.
+    Cancelled,
     Io(String),
     /// Процесс завершился успешно, но результат непригоден.
     EmptyOutput,
     /// В файле нет сигнатуры ISO-контейнера — успешный код возврата ещё не
     /// означает, что получилось видео.
-    NotAnMp4 { head: String },
+    NotAnMp4 {
+        head: String,
+    },
 }
 
 impl std::fmt::Display for RenderError {
@@ -97,6 +108,7 @@ impl std::fmt::Display for RenderError {
                 None => write!(f, "ffmpeg прерван сигналом: {stderr_tail}"),
             },
             Self::TimedOut { seconds } => write!(f, "ffmpeg не уложился в {seconds} с и был снят"),
+            Self::Cancelled => write!(f, "рендер остановлен; дочерний процесс завершён"),
             Self::Io(detail) => write!(f, "ошибка файловой системы: {detail}"),
             Self::EmptyOutput => write!(f, "ffmpeg отчитался об успехе, но файл пуст"),
             Self::NotAnMp4 { head } => {
@@ -109,14 +121,101 @@ impl std::fmt::Display for RenderError {
 /// Проверяет, доступен ли ffmpeg. Вызывается до сборки аргументов, чтобы
 /// отличить «нет инструмента» от «инструмент отказался работать».
 pub async fn ffmpeg_available() -> bool {
-    tokio::process::Command::new(FFMPEG_BIN)
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+    probe_ffmpeg(None).await.is_ok()
+}
+
+async fn probe_ffmpeg(cancel_rx: Option<&mut watch::Receiver<bool>>) -> Result<(), RenderError> {
+    let mut command = Command::new(FFMPEG_BIN);
+    command.arg("-version");
+    let result = run_process(&mut command, PROBE_TIMEOUT, cancel_rx).await;
+    match result {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) | Err(RenderError::Spawn(_)) => Err(RenderError::FfmpegUnavailable),
+        Err(error) => Err(error),
+    }
+}
+
+fn cancelled(cancel_rx: Option<&watch::Receiver<bool>>) -> bool {
+    cancel_rx.is_some_and(|rx| *rx.borrow())
+}
+
+async fn wait_for_stop(cancel_rx: Option<&mut watch::Receiver<bool>>) {
+    if let Some(rx) = cancel_rx {
+        if *rx.borrow() {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return;
+            }
+        }
+    }
+    // Закрытие канала само по себе не является командой остановки.
+    std::future::pending::<()>().await
+}
+
+async fn run_process(
+    command: &mut Command,
+    timeout: Duration,
+    cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> Result<std::process::Output, RenderError> {
+    if cancelled(cancel_rx.as_deref()) {
+        return Err(RenderError::Cancelled);
+    }
+    let child = command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| RenderError::Spawn(error.to_string()))?;
+    wait_for_process(child, timeout, cancel_rx).await
+}
+
+async fn wait_for_process(
+    mut child: tokio::process::Child,
+    timeout: Duration,
+    cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> Result<std::process::Output, RenderError> {
+    let mut stdout = child.stdout.take().expect("stdout настроен как piped");
+    let mut stderr = child.stderr.take().expect("stderr настроен как piped");
+    // wait и оба pipe читаются одновременно: заполненный stderr не должен
+    // удерживать процесс, завершения которого мы ожидаем.
+    let result = {
+        let completion = async {
+            let mut stdout_bytes = Vec::new();
+            let mut stderr_bytes = Vec::new();
+            let (status, _, _) = tokio::try_join!(
+                child.wait(),
+                stdout.read_to_end(&mut stdout_bytes),
+                stderr.read_to_end(&mut stderr_bytes),
+            )?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = wait_for_stop(cancel_rx) => Err(RenderError::Cancelled),
+            completed = tokio::time::timeout(timeout, completion) => match completed {
+                Ok(Ok(output)) => Ok(output),
+                Ok(Err(error)) => Err(RenderError::Io(error.to_string())),
+                Err(_) => Err(RenderError::TimedOut { seconds: timeout.as_secs() }),
+            },
+        }
+    };
+    if result.is_err() {
+        // completion уже уничтожен: borrow child завершён. Нормальная
+        // остановка ждёт kill+reap до возврата и удаления временных файлов.
+        // kill_on_drop остаётся страховкой при уничтожении всего future.
+        let _ = child.kill().await;
+        child.wait().await.map_err(|error| {
+            RenderError::Io(format!("не удалось дождаться остановки ffmpeg: {error}"))
+        })?;
+    }
+    result
 }
 
 /// Экранирует путь для синтаксиса фильтра: двоеточие в нём разделяет опции.
@@ -186,11 +285,33 @@ pub async fn render_slideshow(
     credits: &str,
     out_dir: &Path,
 ) -> Result<RenderOutcome, RenderError> {
+    render_slideshow_inner(files, credits, out_dir, None).await
+}
+
+pub async fn render_slideshow_cancellable(
+    files: &[DownloadedAsset],
+    credits: &str,
+    out_dir: &Path,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<RenderOutcome, RenderError> {
+    render_slideshow_inner(files, credits, out_dir, Some(cancel_rx)).await
+}
+
+async fn render_slideshow_inner(
+    files: &[DownloadedAsset],
+    credits: &str,
+    out_dir: &Path,
+    mut cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> Result<RenderOutcome, RenderError> {
     if files.is_empty() {
         return Err(RenderError::NoInputs);
     }
-    if !ffmpeg_available().await {
-        return Err(RenderError::FfmpegUnavailable);
+    if cancelled(cancel_rx.as_deref()) {
+        return Err(RenderError::Cancelled);
+    }
+    probe_ffmpeg(cancel_rx.as_deref_mut()).await?;
+    if cancelled(cancel_rx.as_deref()) {
+        return Err(RenderError::Cancelled);
     }
 
     std::fs::create_dir_all(out_dir).map_err(|e| RenderError::Io(e.to_string()))?;
@@ -203,24 +324,17 @@ pub async fn render_slideshow(
     let filter = build_filter_complex(files.len(), &credits_file);
     let args = build_args(files, &filter, &output);
 
-    let mut command = tokio::process::Command::new(FFMPEG_BIN);
+    let mut command = Command::new(FFMPEG_BIN);
     // Каждый аргумент — отдельный элемент argv. Оболочка не участвует.
     for arg in &args {
         command.arg(arg);
     }
 
     let started = Instant::now();
-    let result = tokio::time::timeout(RENDER_TIMEOUT, command.output()).await;
-
-    let output_result = match result {
-        Ok(Ok(out)) => out,
-        Ok(Err(err)) => return Err(RenderError::Spawn(err.to_string())),
-        Err(_) => {
-            return Err(RenderError::TimedOut {
-                seconds: RENDER_TIMEOUT.as_secs(),
-            })
-        }
-    };
+    let output_result = run_process(&mut command, RENDER_TIMEOUT, cancel_rx.as_deref_mut()).await?;
+    if cancelled(cancel_rx.as_deref()) {
+        return Err(RenderError::Cancelled);
+    }
     let elapsed_ms = started.elapsed().as_millis();
 
     if !output_result.status.success() {
@@ -354,6 +468,111 @@ mod tests {
     async fn no_inputs_fails_before_spawning() {
         let result = render_slideshow(&[], "credits", Path::new("./unused")).await;
         assert_eq!(result, Err(RenderError::NoInputs));
+    }
+
+    #[tokio::test]
+    async fn precancelled_render_and_probe_do_not_spawn_or_create_output() {
+        let dir = std::env::temp_dir().join(format!("kaic-render-cancel-{}", uuid::Uuid::new_v4()));
+        let (_sender, mut receiver) = watch::channel(true);
+        assert_eq!(
+            render_slideshow_cancellable(&[asset("unused.jpg")], "credits", &dir, &mut receiver)
+                .await,
+            Err(RenderError::Cancelled)
+        );
+        assert!(!dir.exists());
+        let mut command = Command::new("kaic-deliberately-nonexistent-render-command");
+        assert!(matches!(
+            run_process(&mut command, Duration::from_secs(1), Some(&mut receiver)).await,
+            Err(RenderError::Cancelled)
+        ));
+        assert_eq!(
+            render_slideshow_cancellable(&[], "credits", &dir, &mut receiver).await,
+            Err(RenderError::NoInputs)
+        );
+    }
+
+    async fn hanging_child_ready() -> tokio::process::Child {
+        let mut child = Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                "import sys, threading; sys.stdout.write('ready\\n'); sys.stdout.flush(); threading.Event().wait()",
+            ])
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 6];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            child.stdout.as_mut().unwrap().read_exact(&mut ready),
+        )
+        .await
+        .expect("synthetic process must announce readiness")
+        .unwrap();
+        assert_eq!(&ready, b"ready\n");
+        child
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_process_reaped(pid: u32) {
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "helper returned before its child was terminated and reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_child_termination_before_returning() {
+        let child = hanging_child_ready().await;
+        let pid = child.id().unwrap();
+        let (sender, mut receiver) = watch::channel(false);
+        let process = tokio::spawn(async move {
+            wait_for_process(child, Duration::from_secs(60), Some(&mut receiver)).await
+        });
+        sender.send(true).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), process)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(RenderError::Cancelled)
+        ));
+        #[cfg(target_os = "linux")]
+        assert_process_reaped(pid);
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
+
+    #[tokio::test]
+    async fn deadline_waits_for_child_termination_before_returning() {
+        let child = hanging_child_ready().await;
+        let pid = child.id().unwrap();
+        assert!(matches!(
+            wait_for_process(child, Duration::from_millis(25), None).await,
+            Err(RenderError::TimedOut { .. })
+        ));
+        #[cfg(target_os = "linux")]
+        assert_process_reaped(pid);
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_are_drained_while_waiting_for_exit() {
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            "import sys; sys.stdout.write('x' * 131072); sys.stdout.flush(); sys.stderr.write('y' * 131072); sys.stderr.flush()",
+        ]);
+        let output = run_process(&mut command, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, vec![b'x'; 131_072]);
+        assert_eq!(output.stderr, vec![b'y'; 131_072]);
     }
 
     #[tokio::test]

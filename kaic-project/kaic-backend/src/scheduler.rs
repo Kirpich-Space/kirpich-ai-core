@@ -15,13 +15,9 @@
 //! Tokio уже даёт асинхронный runtime, Scheduler поверх него — обычная
 //! бизнес-логика.
 //!
-//! Параллелизм: `run()` целиком выполняется под одной блокировкой —
-//! на время всего цикла (подбор модели + генерация) система обслуживает
-//! только один запрос. Для одного пользователя на одной видеокарте это
-//! осознанное упрощение: настоящая конкурентная работа с несколькими
-//! одновременно загруженными моделями всё равно упирается в одно и то же
-//! железо, а счётчик "модель сейчас используется" — это сложность, которую
-//! стоит добавить только когда реальный сценарий её потребует.
+//! Подбор/резервирование выполняются под gpu_lock, генерация — без него.
+//! Две сессии могут использовать уже загруженные модели. RAII защищает
+//! счётчики занятости и маркеры загрузки/выгрузки от отмены future.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,8 +39,10 @@ pub type ModelId = String;
 /// размещение (`fit_and_load`) и стартовая диагностика (`reachability`).
 /// Диагностика обязана отвечать ровно то же, что решит Scheduler, — иначе
 /// она начнёт врать, а врущая диагностика хуже её отсутствия.
-fn fits_in_budget(used_mb: u32, needed_mb: u32, budget_mb: u32) -> bool {
-    used_mb + needed_mb <= budget_mb
+fn fits_in_budget(used_mb: u64, needed_mb: u32, budget_mb: u32) -> bool {
+    used_mb
+        .checked_add(u64::from(needed_mb))
+        .is_some_and(|total_mb| total_mb <= u64::from(budget_mb))
 }
 
 /// Хвост строки выбора модели: почему не подошли предыдущие кандидаты.
@@ -65,7 +63,7 @@ pub struct ReachabilityReport {
     pub budget_mb: u32,
     /// Сколько бюджета занято резидентами постоянно: они исключены из
     /// вытеснения, поэтому это пол, ниже которого свободная память не растёт.
-    pub resident_mb: u32,
+    pub resident_mb: u64,
     /// Модели, которые не помещаются в бюджет даже поверх одних резидентов,
     /// то есть не могут быть выбраны никогда. Имя и его `vram_mb`.
     pub unreachable: Vec<(String, u32)>,
@@ -144,7 +142,7 @@ pub struct Scheduler {
     ///
     /// `std::sync::Mutex`, а не `tokio` — держится микросекунды и через
     /// `await` не проносится никогда (см. правило порядка ниже).
-    current_operation: std::sync::Mutex<Option<ActiveOperation>>,
+    current_operation: std::sync::Mutex<OperationState>,
 
     /// Сколько генераций идёт на каждой модели прямо сейчас.
     ///
@@ -249,6 +247,38 @@ pub struct ActiveOperation {
     pub started_at: DateTime<Utc>,
 }
 
+#[derive(Default)]
+struct OperationState {
+    generation: u64,
+    current: Option<(u64, ActiveOperation)>,
+    // generation and whether this was a load; persists locally after drop.
+    uncertain: HashMap<ModelId, (u64, bool)>,
+}
+
+struct OperationGuard<'a> {
+    scheduler: &'a Scheduler,
+    generation: u64,
+    model: ModelId,
+}
+
+impl OperationGuard<'_> {
+    fn complete(self) {
+        let mut state = self.scheduler.operation_state();
+        if state.uncertain.get(&self.model).map(|(id, _)| *id) == Some(self.generation) {
+            state.uncertain.remove(&self.model);
+        }
+    }
+}
+
+impl Drop for OperationGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.scheduler.operation_state();
+        if state.current.as_ref().map(|(id, _)| *id) == Some(self.generation) {
+            state.current = None;
+        }
+    }
+}
+
 impl Scheduler {
     /// Создаёт Scheduler.
     ///
@@ -267,7 +297,7 @@ impl Scheduler {
             total_model_memory_mb,
             gpu_lock: Mutex::new(()),
             loaded: Mutex::new(HashMap::new()),
-            current_operation: std::sync::Mutex::new(None),
+            current_operation: std::sync::Mutex::new(OperationState::default()),
             busy: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -306,30 +336,100 @@ impl Scheduler {
     // `pick_eviction_victim` вызывается под `loaded` и берёт `busy` —
     // порядок 2 → 3 соблюдён.
 
-    /// Отмечает начало операции. Вызывается ТОЛЬКО вне блокировки `loaded`.
-    fn begin_operation(&self, kind: &'static str, model: &str, reason: &str) {
-        if let Ok(mut slot) = self.current_operation.lock() {
-            *slot = Some(ActiveOperation {
+    /// Маркер и неопределённость устанавливаются ДО сетевого запроса.
+    /// Guard снимает только собственный маркер, включая drop future.
+    fn begin_operation(&self, kind: &'static str, model: &str, reason: &str) -> OperationGuard<'_> {
+        let mut state = self.operation_state();
+        state.generation += 1;
+        let generation = state.generation;
+        state
+            .uncertain
+            .insert(model.to_string(), (generation, kind == "загрузка"));
+        state.current = Some((
+            generation,
+            ActiveOperation {
                 kind,
                 model: model.to_string(),
                 reason: reason.to_string(),
                 started_at: Utc::now(),
-            });
+            },
+        ));
+        OperationGuard {
+            scheduler: self,
+            generation,
+            model: model.to_string(),
         }
     }
 
-    /// Снимает отметку операции. Вызывается в том числе на путях отказа —
-    /// иначе `/status` навсегда застрял бы на несостоявшейся загрузке.
-    fn end_operation(&self) {
-        if let Ok(mut slot) = self.current_operation.lock() {
-            *slot = None;
-        }
+    fn operation_state(&self) -> std::sync::MutexGuard<'_, OperationState> {
+        self.current_operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Что выполняется прямо сейчас, если выполняется.
-    /// Не берёт ни `gpu_lock`, ни `loaded` — отвечает всегда.
+    /// Не берёт ни gpu_lock, ни loaded и отвечает во время сетевой операции.
     pub fn active_operation(&self) -> Option<ActiveOperation> {
-        self.current_operation.lock().ok().and_then(|s| s.clone())
+        self.operation_state()
+            .current
+            .as_ref()
+            .map(|(_, op)| op.clone())
+    }
+
+    /// Неопределённость видна даже до следующей попытки размещения.
+    pub fn recovery_warnings(&self) -> Vec<String> {
+        let state = self.operation_state();
+        let current = state.current.as_ref().map(|(id, _)| *id);
+        let mut warnings: Vec<_> = state.uncertain.iter()
+            .filter(|(_, (generation, _))| current != Some(*generation))
+            .map(|(model, (_, loading))| format!(
+                "неизвестен исход {} модели '{}'; перед повторной загрузкой KAIC проверит состояние. Если ответ с instance_id утрачен, проверьте LM Studio вручную и перезапустите KAIC; чужие инстансы автоматически не выгружаются",
+                if *loading { "загрузки" } else { "выгрузки" }, model,
+            ))
+            .collect();
+        warnings.sort();
+        warnings
+    }
+
+    /// После отмены нельзя доверять ни старому кэшу, ни предположению, что
+    /// удалённый запрос тоже отменён. Backend должен подтвердить исход;
+    /// если это невозможно, дальнейшее размещение закрыто безопасным отказом.
+    /// Вызывается под gpu_lock до резервирования и изменения набора моделей.
+    async fn reconcile_interrupted_operations(&self) -> Result<()> {
+        let uncertain: Vec<_> = self
+            .operation_state()
+            .uncertain
+            .iter()
+            .map(|(model, (generation, loading))| (model.clone(), *generation, *loading))
+            .collect();
+        for (model, generation, loading) in uncertain {
+            let loaded = self
+                .backend
+                .reconcile_interrupted_operation(
+                    self.resource_registry.provider_key(&model),
+                    loading,
+                )
+                .await
+                .map_err(|err| {
+                    anyhow!(
+                "неизвестен исход операции с моделью '{model}'; размещение остановлено: {err:#}"
+            )
+                })?;
+            if loaded {
+                self.loaded.lock().await.insert(
+                    model.clone(),
+                    ModelUsage {
+                        last_used: Utc::now(),
+                    },
+                );
+            } else {
+                self.loaded.lock().await.remove(&model);
+            }
+            let mut state = self.operation_state();
+            if state.uncertain.get(&model).map(|(id, _)| *id) == Some(generation) {
+                state.uncertain.remove(&model);
+            }
+        }
+        Ok(())
     }
 
     fn busy_table(&self) -> std::sync::MutexGuard<'_, HashMap<ModelId, usize>> {
@@ -399,7 +499,7 @@ impl Scheduler {
         // резидентов, иначе модель считалась бы конкурентом самой себе.
         let is_reachable = |name: &str, entry: &crate::resource_registry::ResourceEntry| {
             let floor = if entry.always_loaded {
-                resident_mb.saturating_sub(entry.vram_mb)
+                resident_mb - u64::from(entry.vram_mb)
             } else {
                 resident_mb
             };
@@ -462,7 +562,8 @@ impl Scheduler {
              (свободно под задачу: {} MB)",
             report.budget_mb,
             report.resident_mb,
-            report.budget_mb.saturating_sub(report.resident_mb),
+            // Только отображение неотрицательного остатка, не admission.
+            u64::from(report.budget_mb).saturating_sub(report.resident_mb),
         );
 
         if report.unreachable.is_empty() {
@@ -509,68 +610,36 @@ impl Scheduler {
             .collect()
     }
 
-    /// Загружает все `always_loaded` модели при старте системы
-    /// и отмечает их как резидентные. Вызывается один раз в `main.rs`.
-    /// Выгружает всё, что осталось в backend'е от прошлых запусков.
-    ///
-    /// Вызывается на старте, ДО `preload_always_loaded`. Причина не в
-    /// аккуратности, а в наблюдённом отказе: `preload_always_loaded` грузит
-    /// always_loaded-модели при каждом запуске, парной выгрузки при
-    /// завершении процесса нет, и после нескольких перезапусков в LM Studio
-    /// накопилось шесть инстансов одной модели — седьмой уже не влез, и
-    /// backend перестал стартовать вовсе.
-    ///
-    /// Чистка сделана на СТАРТЕ, а не на выходе, потому что выход бывает
-    /// разный: Ctrl+C, kill из диспетчера, краш, отключение питания. Ни один
-    /// из них не обязан выполнить наш код. Стартовая чистка не зависит от
-    /// того, как завершился прошлый процесс, — она разбирается со
-    /// следствием, а не пытается перехватить все причины.
-    ///
-    /// Идемпотентна: на чистом backend'е ничего не находит и молча выходит.
-    ///
-    /// Ошибка перечисления не считается фатальной — backend может не уметь
-    /// перечислять инстансы. В этом случае мы просто теряем чистку, а не
-    /// возможность работать.
+    /// Выгружает только инстансы с подтверждённым владением этим backend.
+    /// После рестарта владение чужими/старыми инстансами не предполагается.
     pub async fn unload_stale_instances(&self) -> Result<()> {
-        let instances = match self.backend.loaded_instances().await {
-            Ok(instances) => instances,
-            Err(err) => {
-                tracing::warn!("не удалось получить список загруженных инстансов: {err:#}");
-                return Ok(());
-            }
-        };
-
-        if instances.is_empty() {
-            tracing::info!("стартовая чистка: посторонних инстансов нет");
-            return Ok(());
+        let _operation = self.gpu_lock.lock().await;
+        let instances = self.backend.loaded_instances().await?;
+        let owned = self.backend.owned_instances().await?;
+        let foreign: Vec<_> = instances.iter().filter(|id| !owned.contains(id)).collect();
+        if !foreign.is_empty() {
+            tracing::warn!(instances = ?foreign,
+                "LM Studio: инстансы без подтверждённого владения сохранены; они могут занимать память вне бюджета KAIC");
         }
-
-        tracing::info!(
-            "стартовая чистка: найдено {} инстансов от прошлых запусков, выгружаю",
-            instances.len()
-        );
-        for instance in &instances {
-            match self.backend.unload_instance(instance).await {
-                Ok(()) => tracing::info!("выгружен инстанс '{instance}'"),
-                // Один упрямый инстанс не должен мешать старту: остальные
-                // всё равно освободят память.
-                Err(err) => tracing::warn!("не удалось выгрузить '{instance}': {err:#}"),
-            }
+        for instance in owned {
+            self.backend.unload_instance(&instance).await?;
         }
-
-        // Внутренний учёт тоже обнуляем: он описывал состояние, которого
-        // больше нет.
         self.loaded.lock().await.clear();
         Ok(())
     }
 
     pub async fn preload_always_loaded(&self) -> Result<()> {
+        if self.backend.externally_managed() {
+            let _operation = self.gpu_lock.lock().await;
+            return self.sync_external_models().await;
+        }
+
         // Проверяем ещё до первого вызова backend.load(), что always_loaded
         // модели вообще помещаются в бюджет — иначе ошибка всплыла бы
         // только как сырой отказ от LM Studio при загрузке, а тут причина
         // видна сразу и явно.
         let required = self.resource_registry.always_loaded_vram_mb();
-        if required > self.total_model_memory_mb {
+        if required > u64::from(self.total_model_memory_mb) {
             return Err(anyhow!(
                 "always_loaded модели требуют {required} MB памяти, \
                  а бюджет всего {} MB — проверьте resource_registry.yaml",
@@ -582,16 +651,46 @@ impl Scheduler {
         // инвариант «не более одной загрузки одновременно» должен держаться
         // одним механизмом на всех путях, а не «на старте и так никого».
         let _guard = self.gpu_lock.lock().await;
+        self.reconcile_interrupted_operations().await?;
+
+        // Предзагрузка может вызываться повторно, уже при заполненном кеше.
+        // Резидентов учитываем ровно один раз, включая ещё не загруженных.
+        // Отказываем до первого load, не вытесняя существующий кеш.
+        let cached_mb: u64 = self
+            .loaded
+            .lock()
+            .await
+            .keys()
+            .filter_map(|name| self.resource_registry.get(name))
+            .filter(|entry| !entry.always_loaded)
+            .map(|entry| u64::from(entry.vram_mb))
+            .sum();
+        if required
+            .checked_add(cached_mb)
+            .is_none_or(|total| total > u64::from(self.total_model_memory_mb))
+        {
+            return Err(anyhow!(
+                "always_loaded модели требуют {required} MB, кеш занимает {cached_mb} MB, \
+                 бюджет {} MB — предзагрузка отменена без вытеснения кеша",
+                self.total_model_memory_mb
+            ));
+        }
 
         for model in self.resource_registry.always_loaded_models() {
-            self.begin_operation("загрузка", model, "always_loaded");
+            if self.loaded.lock().await.contains_key(model) {
+                continue;
+            }
+            let operation = self.begin_operation("загрузка", model, "always_loaded");
             let outcome = self
                 .backend
                 .load(self.resource_registry.provider_key(model))
                 .await;
-            self.end_operation();
-            outcome
-                .map_err(|e| anyhow!("не удалось загрузить always_loaded модель {model}: {e}"))?;
+            if let Err(err) = outcome {
+                if err.is::<crate::model_backend::ModelOperationRejected>() {
+                    operation.complete();
+                }
+                return Err(anyhow!("не удалось загрузить always_loaded модель {model}: {err}"));
+            }
 
             // Короткая блокировка состояния — уже после загрузки.
             self.loaded.lock().await.insert(
@@ -600,6 +699,7 @@ impl Scheduler {
                     last_used: Utc::now(),
                 },
             );
+            operation.complete();
         }
         Ok(())
     }
@@ -651,6 +751,13 @@ impl Scheduler {
         category: &str,
         allow_manual: bool,
     ) -> Result<(ModelId, GenerationGuard)> {
+        let Ok(operation) = self.gpu_lock.try_lock() else {
+            return Err(anyhow!("GPU сейчас занят другой задачей, повторите позже"));
+        };
+        self.reconcile_interrupted_operations().await?;
+        if self.backend.externally_managed() {
+            self.sync_external_models().await?;
+        }
         let running = self.running_generations();
 
         if running >= MAX_CONCURRENT_TASKS {
@@ -704,10 +811,6 @@ impl Scheduler {
         // ДО отпускания лока — иначе между загрузкой и началом генерации
         // осталось бы окно, в котором модель можно было бы вытеснить.
         let (model_id, guard) = {
-            let Ok(operation) = self.gpu_lock.try_lock() else {
-                return Err(anyhow!("GPU сейчас занят другой задачей, повторите позже"));
-            };
-
             let model_id = match self.select_model(category, allow_manual).await {
                 SchedulerResult::Ready(model_id) => model_id,
                 SchedulerResult::Failed(reason) => return Err(anyhow!(reason)),
@@ -804,6 +907,13 @@ impl Scheduler {
         // Правила допуска те же, что у run(): служебный вызов — такая же
         // генерация и так же обязан отмечаться занятым, иначе его модель
         // вытеснят из-под него.
+        let Ok(operation) = self.gpu_lock.try_lock() else {
+            return Err(anyhow!("GPU сейчас занят другой задачей, повторите позже"));
+        };
+        self.reconcile_interrupted_operations().await?;
+        if self.backend.externally_managed() {
+            self.sync_external_models().await?;
+        }
         let running = self.running_generations();
         if running >= MAX_CONCURRENT_TASKS {
             return Err(anyhow!(
@@ -836,9 +946,6 @@ impl Scheduler {
                      — повторите позже"
                 ));
             }
-            let Ok(operation) = self.gpu_lock.try_lock() else {
-                return Err(anyhow!("GPU сейчас занят другой задачей, повторите позже"));
-            };
             if !self
                 .fit_and_load(model_label, resource.vram_mb, model_label)
                 .await
@@ -847,13 +954,11 @@ impl Scheduler {
                     "не удалось разместить модель '{model_label}' в VRAM"
                 ));
             }
-            let guard = self
-                .try_begin_generation(model_label)
-                .ok_or_else(|| anyhow!("предел одновременных задач ({MAX_CONCURRENT_TASKS})"))?;
-            drop(operation);
-            guard
+            self.try_begin_generation(model_label)
+                .ok_or_else(|| anyhow!("предел одновременных задач ({MAX_CONCURRENT_TASKS})"))?
         };
 
+        drop(operation);
         self.generate(model_label, request, guard).await
     }
 
@@ -889,6 +994,18 @@ impl Scheduler {
             return SchedulerResult::Failed(format!(
                 "категория '{category}' требует явного запроса пользователя (manual_only)"
             ));
+        }
+
+        if self.backend.externally_managed() {
+            if let Err(error) = self.sync_external_models().await {
+                return SchedulerResult::Failed(format!("llama-server: {error:#}"));
+            }
+            return match self.already_loaded_candidate(category, allow_manual).await {
+                Some(model) => SchedulerResult::Ready(model),
+                None => SchedulerResult::Failed(format!(
+                    "ни один кандидат '{category}' не обслуживается внешним backend; проверьте model_id и запущенную GGUF-модель"
+                )),
+            };
         }
 
         // Почему предыдущие кандидаты не подошли — накапливаем, чтобы
@@ -963,22 +1080,52 @@ impl Scheduler {
     /// Гонки при этом нет: конкурента не существует, `gpu_lock` пропускает
     /// сюда только один запрос за раз.
     async fn fit_and_load(&self, candidate: &str, needed_memory_mb: u32, reason: &str) -> bool {
+        if self.backend.externally_managed() {
+            tracing::warn!("внешний backend не поддерживает загрузку/вытеснение '{candidate}'");
+            return false;
+        }
+
+        if let Err(err) = self.reconcile_interrupted_operations().await {
+            tracing::warn!("{err:#}");
+            return false;
+        }
         loop {
             // --- решение: короткая блокировка состояния ---
             let step = {
                 let loaded = self.loaded.lock().await;
-                let used_memory_mb: u32 = loaded
+                // Уникальные ключи loaded — подмножество реестра, чья
+                // полная сумма уже проверена на представимость в u64.
+                let used_memory_mb: u64 = loaded
                     .keys()
                     .filter_map(|name| self.resource_registry.get(name))
-                    .map(|r| r.vram_mb)
+                    .map(|r| u64::from(r.vram_mb))
                     .sum();
 
                 if fits_in_budget(used_memory_mb, needed_memory_mb, self.total_model_memory_mb) {
                     Step::Load
                 } else {
-                    match self.pick_eviction_victim(&loaded) {
-                        Some(victim) => Step::Evict(victim, used_memory_mb),
-                        None => Step::GiveUp(used_memory_mb),
+                    // Проверяем весь доступный выигрыш ДО первой выгрузки:
+                    // недостижимый primary не должен уничтожать кеш fallback.
+                    let protected_memory_mb = {
+                        let busy = self.busy_table();
+                        loaded
+                            .keys()
+                            .filter(|name| !self.can_evict(name, &busy))
+                            .filter_map(|name| self.resource_registry.get(name))
+                            .map(|resource| u64::from(resource.vram_mb))
+                            .sum()
+                    };
+                    if !fits_in_budget(
+                        protected_memory_mb,
+                        needed_memory_mb,
+                        self.total_model_memory_mb,
+                    ) {
+                        Step::GiveUp(used_memory_mb)
+                    } else {
+                        match self.pick_eviction_victim(&loaded) {
+                            Some(victim) => Step::Evict(victim, used_memory_mb),
+                            None => Step::GiveUp(used_memory_mb),
+                        }
                     }
                 }
             }; // лок состояния отпущен здесь — до всякого await
@@ -993,18 +1140,21 @@ impl Scheduler {
                         .map(|r| r.vram_mb)
                         .unwrap_or(0);
 
-                    self.begin_operation("выгрузка", &victim, reason);
+                    let operation = self.begin_operation("выгрузка", &victim, reason);
                     let outcome = self
                         .backend
                         .unload(self.resource_registry.provider_key(&victim))
                         .await;
-                    self.end_operation();
 
-                    if outcome.is_err() {
-                        tracing::warn!("не удалось выгрузить модель '{victim}' для освобождения VRAM");
+                    if let Err(err) = outcome {
+                        if err.is::<crate::model_backend::ModelOperationRejected>() {
+                            operation.complete();
+                        }
+                        tracing::warn!("не удалось выгрузить модель '{victim}' для освобождения VRAM: {err:#}");
                         return false;
                     }
                     self.loaded.lock().await.remove(&victim);
+                    operation.complete();
                     tracing::info!(
                         "вытеснена '{victim}' ради '{candidate}': освобождено {freed} MB, \
                          требуется {needed_memory_mb} MB, было занято {used_memory_mb} MB \
@@ -1014,10 +1164,8 @@ impl Scheduler {
                 }
 
                 Step::GiveUp(used_memory_mb) => {
-                    // Вытеснять нечего: остались только резиденты и модели,
-                    // на которых прямо сейчас идёт генерация. Занятую
-                    // выгружать нельзя — это выдернуло бы модель из-под
-                    // работающего запроса.
+                    // Даже всё допустимое вытеснение не освободит достаточно
+                    // памяти. Резиденты и занятые модели остаются на месте.
                     let busy: Vec<String> = self
                         .busy_models()
                         .into_iter()
@@ -1030,8 +1178,8 @@ impl Scheduler {
                     };
                     tracing::warn!(
                         "'{candidate}' не размещена: требуется {needed_memory_mb} MB, \
-                         занято {used_memory_mb} MB из {} MB бюджета; вытеснять некого \
-                         (кандидаты либо always_loaded, либо заняты) — {busy_note}",
+                         занято {used_memory_mb} MB из {} MB бюджета; допустимого вытеснения недостаточно \
+                         (always_loaded и занятые модели сохраняются) — {busy_note}",
                         self.total_model_memory_mb
                     );
                     return false;
@@ -1052,16 +1200,96 @@ impl Scheduler {
         let busy = self.busy_table();
         loaded
             .iter()
-            .filter(|(name, _)| {
-                !self
-                    .resource_registry
-                    .get(name.as_str())
-                    .map(|r| r.always_loaded)
-                    .unwrap_or(false)
-            })
-            .filter(|(name, _)| busy.get(name.as_str()).copied().unwrap_or(0) == 0)
+            .filter(|(name, _)| self.can_evict(name, &busy))
             .min_by_key(|(_, usage)| usage.last_used)
             .map(|(name, _)| name.clone())
+    }
+
+    /// Наблюдение за внешним процессом не является операцией load. Учитываем
+    /// всю обнаруженную модель, включая её память, даже до первой задачи.
+    async fn sync_external_models(&self) -> Result<()> {
+        let models = self.backend.discover_models().await?;
+        let mut available = HashMap::new();
+        let mut used_mb = 0u64;
+        for model in models {
+            let labels: Vec<_> = self
+                .resource_registry
+                .all()
+                .filter(|(label, _)| self.resource_registry.provider_key(label) == model.id)
+                .collect();
+            if labels.len() != 1 {
+                return Err(anyhow!(
+                    "model ID '{}' должен иметь ровно одну запись model_id в Resource Registry",
+                    model.id
+                ));
+            }
+            let (label, entry) = labels[0];
+            if entry.vram_mb == 0
+                || !fits_in_budget(used_mb, entry.vram_mb, self.total_model_memory_mb)
+            {
+                return Err(anyhow!("для внешней модели '{label}' нужен ненулевой footprint, помещающийся в бюджет памяти"));
+            }
+            // fits_in_budget выше уже проверил сложение и u32-бюджет.
+            used_mb += u64::from(entry.vram_mb);
+            available.insert(
+                label.clone(),
+                ModelUsage {
+                    last_used: Utc::now(),
+                },
+            );
+        }
+        let mut loaded = self.loaded.lock().await;
+        let busy = self.busy_table();
+        if busy
+            .iter()
+            .any(|(model, count)| *count > 0 && !available.contains_key(model))
+        {
+            return Err(anyhow!(
+                "модель внешнего сервера сменилась во время генерации"
+            ));
+        }
+        for (model, usage) in &mut available {
+            if let Some(previous) = loaded.get(model) {
+                usage.last_used = previous.last_used;
+            }
+        }
+        *loaded = available;
+        Ok(())
+    }
+
+    pub async fn backend_info(&self) -> crate::model_backend::BackendInfo {
+        let mut info = crate::model_backend::BackendInfo {
+            name: self.backend.name(),
+            externally_managed: self.backend.externally_managed(),
+            discovery_supported: self.backend.supports_discovery(),
+            connected: None,
+            models: Vec::new(),
+            error: None,
+        };
+        if info.discovery_supported {
+            match self.backend.discover_models().await {
+                Ok(models) => {
+                    info.connected = Some(true);
+                    info.models = models;
+                }
+                Err(error) => {
+                    info.connected = Some(false);
+                    info.error = Some(format!("{error:#}"));
+                }
+            }
+        }
+        info
+    }
+
+    /// Одно правило для оценки освобождаемой памяти и выбора жертвы LRU.
+    fn can_evict(&self, name: &str, busy: &HashMap<ModelId, usize>) -> bool {
+        !self.backend.externally_managed()
+            && !self
+                .resource_registry
+                .get(name)
+                .map(|resource| resource.always_loaded)
+                .unwrap_or(false)
+            && busy.get(name).copied().unwrap_or(0) == 0
     }
 
     /// Загружает модель и вносит её в учёт.
@@ -1078,14 +1306,16 @@ impl Scheduler {
         tracing::info!("загрузка '{candidate}' начата ({needed} MB по реестру)");
         let started = std::time::Instant::now();
 
-        self.begin_operation("загрузка", candidate, reason);
+        let operation = self.begin_operation("загрузка", candidate, reason);
         let outcome = self
             .backend
             .load(self.resource_registry.provider_key(candidate))
             .await;
-        self.end_operation();
 
-        if outcome.is_err() {
+        if let Err(err) = outcome {
+            if err.is::<crate::model_backend::ModelOperationRejected>() {
+                operation.complete();
+            }
             tracing::warn!(
                 "не удалось загрузить модель '{candidate}' (после {:.1} с)",
                 started.elapsed().as_secs_f64()
@@ -1102,6 +1332,7 @@ impl Scheduler {
                 last_used: Utc::now(),
             },
         );
+        operation.complete();
         true
     }
 }
@@ -1113,9 +1344,9 @@ enum Step {
     /// Место есть — грузим.
     Load,
     /// Места нет, но есть кого вытеснить: (жертва, сколько было занято).
-    Evict(ModelId, u32),
+    Evict(ModelId, u64),
     /// Места нет и вытеснять нечего: (сколько было занято).
-    GiveUp(u32),
+    GiveUp(u64),
 }
 
 #[cfg(test)]
@@ -1644,7 +1875,7 @@ mod budget_tests {
         scheduler_with_backend(budget_mb, Arc::new(AlwaysOkBackend))
     }
 
-    fn scheduler_with_backend(
+    pub(super) fn scheduler_with_backend(
         budget_mb: u32,
         backend: Arc<dyn ModelBackend>,
     ) -> (Scheduler, PathBuf) {
@@ -1784,3 +2015,235 @@ Resident:
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct ControlledBackend {
+        remote_loaded: std::sync::Mutex<std::collections::HashSet<String>>,
+        pause_load: AtomicBool,
+        pause_unload: AtomicBool,
+        load_count: AtomicUsize,
+        reject_primary: AtomicBool,
+        entered: Notify,
+        release: Notify,
+        unloaded: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ModelBackend for ControlledBackend {
+        async fn is_loaded(&self, model: &str) -> Result<bool> {
+            Ok(self.remote_loaded.lock().unwrap().contains(model))
+        }
+        async fn load(&self, model: &str) -> Result<()> {
+            if model == "TooBig" && self.reject_primary.load(Ordering::SeqCst) {
+                return Err(crate::model_backend::ModelOperationRejected(
+                    "explicit rejection".into(),
+                )
+                .into());
+            }
+            self.load_count.fetch_add(1, Ordering::SeqCst);
+            self.remote_loaded.lock().unwrap().insert(model.to_string());
+            if self.pause_load.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+        async fn unload(&self, model: &str) -> Result<()> {
+            self.remote_loaded.lock().unwrap().remove(model);
+            if self.pause_unload.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+        async fn generate(&self, _: &str, _: GenerateRequest) -> Result<GenerateResponse> {
+            Ok(GenerateResponse::Text("ok".into()))
+        }
+        async fn reconcile_interrupted_operation(&self, model: &str, _: bool) -> Result<bool> {
+            // Fake applies its remote effect synchronously before the gate;
+            // after drop no background work remains, so the snapshot is final.
+            self.is_loaded(model).await
+        }
+        async fn loaded_instances(&self) -> Result<Vec<String>> {
+            Ok(vec!["owned".into(), "other-client".into()])
+        }
+        async fn owned_instances(&self) -> Result<Vec<String>> {
+            Ok(vec!["owned".into()])
+        }
+        async fn unload_instance(&self, id: &str) -> Result<()> {
+            self.unloaded.lock().unwrap().push(id.into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn definite_primary_rejection_preserves_fallback_without_uncertainty() {
+        let backend = Arc::new(ControlledBackend::default());
+        backend.reject_primary.store(true, Ordering::SeqCst);
+        let (mut scheduler, dir) = budget_tests::scheduler_with_backend(26000, backend.clone());
+        let capabilities = dir.join("fallback.yaml");
+        std::fs::write(
+            &capabilities,
+            "Heavy:\n  primary: TooBig\n  fallback: [Fits]\n",
+        )
+        .unwrap();
+        scheduler.capability_registry =
+            Arc::new(CapabilityRegistry::from_file(capabilities).unwrap());
+        let (model, guard) = scheduler.acquire("Heavy", false).await.unwrap();
+        assert_eq!(model, "Fits");
+        assert!(scheduler.recovery_warnings().is_empty());
+        assert_eq!(backend.load_count.load(Ordering::SeqCst), 1);
+        drop(guard);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_preload_reconciles_before_attempting_another_load() {
+        let backend = Arc::new(ControlledBackend::default());
+        backend.pause_load.store(true, Ordering::SeqCst);
+        let (scheduler, dir) = budget_tests::scheduler_with_backend(26000, backend.clone());
+        let scheduler = Arc::new(scheduler);
+        let worker = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.preload_always_loaded().await })
+        };
+        backend.entered.notified().await;
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        backend.pause_load.store(false, Ordering::SeqCst);
+        scheduler.preload_always_loaded().await.unwrap();
+        assert_eq!(backend.load_count.load(Ordering::SeqCst), 1);
+        assert!(scheduler.recovery_warnings().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_preload_does_not_duplicate_a_confirmed_resident() {
+        let backend = Arc::new(ControlledBackend::default());
+        let (scheduler, dir) = budget_tests::scheduler_with_backend(26000, backend.clone());
+        scheduler.preload_always_loaded().await.unwrap();
+        scheduler.preload_always_loaded().await.unwrap();
+        assert_eq!(backend.load_count.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_load_releases_marker_and_reconciles_before_reuse() {
+        let backend = Arc::new(ControlledBackend::default());
+        backend.pause_load.store(true, Ordering::SeqCst);
+        let (scheduler, dir) = budget_tests::scheduler_with_backend(26000, backend.clone());
+        let scheduler = Arc::new(scheduler);
+        let worker = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.acquire("Heavy", false).await.map(|_| ()) })
+        };
+        backend.entered.notified().await;
+        assert!(scheduler.active_operation().is_some());
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(scheduler.active_operation().is_none());
+        assert_eq!(scheduler.running_generations(), 0);
+        assert!(scheduler.gpu_lock.try_lock().is_ok());
+        backend.pause_load.store(false, Ordering::SeqCst);
+        let (_, reservation) = scheduler.acquire("Heavy", false).await.unwrap();
+        assert_eq!(backend.load_count.load(Ordering::SeqCst), 1);
+        drop(reservation);
+        assert_eq!(scheduler.running_generations(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_unload_is_not_reused_and_cannot_be_reserved_during_eviction() {
+        let backend = Arc::new(ControlledBackend::default());
+        let (scheduler, dir) = budget_tests::scheduler_with_backend(26000, backend.clone());
+        let scheduler = Arc::new(scheduler);
+        drop(scheduler.acquire("Heavy", false).await.unwrap());
+        backend.pause_unload.store(true, Ordering::SeqCst);
+        let worker = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.acquire("Heaviest", false).await.map(|_| ()) })
+        };
+        backend.entered.notified().await;
+        // The local cached entry still exists, but admission shares the
+        // operation lock with eviction and must not reserve that victim.
+        assert!(scheduler.acquire("Heavy", false).await.is_err());
+        assert!(scheduler
+            .run_with_model(
+                "Fits",
+                GenerateRequest {
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    temperature: None,
+                }
+            )
+            .await
+            .is_err());
+        assert_eq!(scheduler.running_generations(), 0);
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(scheduler.active_operation().is_none());
+        backend.pause_unload.store(false, Ordering::SeqCst);
+        drop(scheduler.acquire("Heavy", false).await.unwrap());
+        assert_eq!(backend.load_count.load(Ordering::SeqCst), 2);
+        assert_eq!(scheduler.running_generations(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_operation_completion_does_not_clear_a_newer_generation() {
+        let (scheduler, dir) =
+            budget_tests::scheduler_with_backend(26000, Arc::new(ControlledBackend::default()));
+        let old = scheduler.begin_operation("загрузка", "Fits", "old");
+        let new = scheduler.begin_operation("выгрузка", "Fits", "new");
+        old.complete();
+        assert_eq!(scheduler.active_operation().unwrap().reason, "new");
+        assert_eq!(
+            scheduler.operation_state().uncertain.get("Fits"),
+            Some(&(new.generation, false))
+        );
+        drop(new);
+        assert!(scheduler.active_operation().is_none());
+        assert!(scheduler.operation_state().uncertain.contains_key("Fits"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_unloads_only_confirmed_owned_instances() {
+        let backend = Arc::new(ControlledBackend::default());
+        let (scheduler, dir) = budget_tests::scheduler_with_backend(26000, backend.clone());
+        scheduler.unload_stale_instances().await.unwrap();
+        assert_eq!(*backend.unloaded.lock().unwrap(), ["owned"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_remote_outcome_fails_closed_without_leaking_capacity() {
+        let (scheduler, dir) = budget_tests::scheduler_with_failing_backend(26000);
+        let old = scheduler.begin_operation("загрузка", "Fits", "interrupted");
+        drop(old);
+        let error = scheduler
+            .acquire("Heavy", false)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("неизвестен исход"));
+        assert!(scheduler.active_operation().is_none());
+        assert_eq!(scheduler.running_generations(), 0);
+        assert!(scheduler.gpu_lock.try_lock().is_ok());
+        assert!(scheduler.operation_state().uncertain.contains_key("Fits"));
+        assert_eq!(scheduler.recovery_warnings().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "scheduler_placement_tests.rs"]
+mod placement_tests;

@@ -43,6 +43,27 @@ pub struct CapabilityRegistry {
 }
 
 impl CapabilityRegistry {
+    /// Явный выбор оператора меняет приоритет только там, где модель уже
+    /// зарегистрирована кандидатом. Новые capabilities не придумываются.
+    pub fn prefer_model(&mut self, model: &str) -> Result<()> {
+        let mut found = false;
+        for entry in self.entries.values_mut() {
+            if entry.primary == model {
+                found = true;
+            } else if entry.fallback.iter().any(|candidate| candidate == model) {
+                entry.fallback.retain(|candidate| candidate != model);
+                let previous = std::mem::replace(&mut entry.primary, model.to_string());
+                entry.fallback.insert(0, previous);
+                found = true;
+            }
+        }
+        anyhow::ensure!(
+            found,
+            "выбранная модель '{model}' не зарегистрирована ни в одной capability"
+        );
+        Ok(())
+    }
+
     /// Загружает реестр из YAML-файла.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -94,6 +115,19 @@ impl CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_preference_only_reorders_registered_candidates_and_keeps_manual_policy() {
+        let entries = serde_yaml::from_str(
+            "Simple: {primary: A, fallback: [B, C]}\nManual: {primary: C, fallback: [B], manual_only: true}\nOther: {primary: A}\n",
+        ).unwrap();
+        let mut registry = CapabilityRegistry { entries };
+        registry.prefer_model("B").unwrap();
+        assert_eq!(registry.candidates("Simple"), ["B", "A", "C"]);
+        assert_eq!(registry.candidates("Other"), ["A"]);
+        assert!(registry.is_manual_only("Manual"));
+        assert!(registry.prefer_model("missing").is_err());
+    }
 
     #[test]
     fn candidates_returns_primary_then_fallback() {

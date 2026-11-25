@@ -81,6 +81,7 @@ pub struct ResourceEntry {
     /// `None` — ключ совпадает с ярлыком (или запись обслуживается
     /// backend'ом, который ходит по `path`, а не по ключу).
     #[serde(default)]
+    #[serde(alias = "model_id")]
     pub lm_studio_key: Option<String>,
 
     /// Эффективная длина контекста загруженной модели (в токенах).
@@ -124,6 +125,9 @@ pub struct ResourceEntry {
 #[derive(Debug)]
 pub struct ResourceRegistry {
     entries: HashMap<String, ResourceEntry>,
+
+    /// One startup snapshot; discovery never grants Scheduler capabilities.
+    local_catalog: Option<crate::model_directory::LocalCatalog>,
 
     /// Откуда реестр прочитан. Нужен, чтобы правка temperature попадала
     /// в тот же файл, а не в предполагаемый.
@@ -199,12 +203,36 @@ impl ResourceRegistry {
             .with_context(|| format!("не удалось прочитать {}", path.display()))?;
         let entries: HashMap<String, ResourceEntry> = serde_yaml::from_str(&raw)
             .with_context(|| format!("не удалось разобрать YAML в {}", path.display()))?;
+        // Оценки неизменяемы после чтения. Ограничиваем сумму ВСЕХ записей,
+        // чтобы любая сумма по уникальным моделям (resident/loaded/protected
+        // и снимок /status) точно представлялась в u64 без насыщения.
+        entries
+            .values()
+            .try_fold(0u64, |total, entry| {
+                total.checked_add(u64::from(entry.vram_mb))
+            })
+            .with_context(|| {
+                format!(
+                    "суммарная память моделей в {} превышает u64::MAX",
+                    path.display()
+                )
+            })?;
         Ok(Self {
             entries,
+            local_catalog: None,
             source_path: path.to_path_buf(),
             temperature_overrides: RwLock::new(HashMap::new()),
             write_lock: Mutex::new(()),
         })
+    }
+
+    pub fn with_local_catalog(mut self, catalog: crate::model_directory::LocalCatalog) -> Self {
+        self.local_catalog = Some(catalog);
+        self
+    }
+
+    pub fn local_catalog(&self) -> Option<&crate::model_directory::LocalCatalog> {
+        self.local_catalog.as_ref()
     }
 
     /// Перечисляет все известные модели вместе с их характеристиками.
@@ -285,11 +313,13 @@ impl ResourceRegistry {
     /// Суммарный объём VRAM (в мегабайтах), который обязаны занимать
     /// always_loaded-модели одновременно. Scheduler использует это как
     /// нижнюю границу постоянно занятой памяти при расчёте свободного места.
-    pub fn always_loaded_vram_mb(&self) -> u32 {
+    /// Сумма u64 точна и может превышать u32-бюджет; сужение запрещено.
+    /// from_file проверяет представимость суммы всего реестра в u64.
+    pub fn always_loaded_vram_mb(&self) -> u64 {
         self.entries
             .values()
             .filter(|e| e.always_loaded)
-            .map(|e| e.vram_mb)
+            .map(|e| u64::from(e.vram_mb))
             .sum()
     }
 
@@ -683,6 +713,39 @@ Fable9B:
         );
     }
 
+    #[test]
+    fn attaching_local_inventory_preserves_explicit_registry_paths_and_persistence() {
+        let dir =
+            std::env::temp_dir().join(format!("kaic-catalog-registry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("resources.yaml");
+        let yaml = "Local:\n  model_id: actual-provider-id\n  path: /explicit/external/model.gguf\n  vram_mb: 100\n  load_seconds: 0\n";
+        std::fs::write(&file, yaml).unwrap();
+        let catalog = crate::model_directory::ModelDirectory::prepare(dir.join("models"))
+            .unwrap()
+            .scan()
+            .unwrap();
+        let registry = ResourceRegistry::from_file(&file)
+            .unwrap()
+            .with_local_catalog(catalog);
+        assert_eq!(registry.all().count(), 1);
+        assert_eq!(registry.provider_key("Local"), "actual-provider-id");
+        assert_eq!(
+            registry.get("Local").unwrap().path.as_deref(),
+            Some("/explicit/external/model.gguf")
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), yaml);
+        registry.set_temperature("Local", Some(0.3)).unwrap();
+        let reopened = ResourceRegistry::from_file(&file).unwrap();
+        assert_eq!(
+            reopened.get("Local").unwrap().path,
+            registry.get("Local").unwrap().path
+        );
+        assert_eq!(reopened.provider_key("Local"), "actual-provider-id");
+        assert_eq!(reopened.temperature_for("Local"), Some(0.3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn sample_registry() -> ResourceRegistry {
         let yaml = r#"
 Nemotron:
@@ -703,6 +766,7 @@ Qwen40B:
         let entries: HashMap<String, ResourceEntry> = serde_yaml::from_str(yaml).unwrap();
         ResourceRegistry {
             entries,
+            local_catalog: None,
             // Тестовый реестр не привязан к файлу: set_temperature здесь
             // не вызывается, а чтение работает и без источника на диске.
             source_path: PathBuf::from("<test>"),
